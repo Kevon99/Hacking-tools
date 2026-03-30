@@ -999,38 +999,97 @@ PYEOF
 # M8 — SECRET DISCOVERY (con filtro de falsos positivos)
 # ──────────────────────────────────────────────
 run_secrets() {
-  log_section "M8 — Secret Discovery (SecretFinder + TruffleHog)"
+  log_section "M8 — Secret Discovery (Calidad sobre Cantidad)"
   local js_urls="${SCORING_DIR}/js_files.txt"
   local raw_secrets="${SECRETS_DIR}/secrets_raw.txt"
   local potential="${SECRETS_DIR}/potential_secrets.txt"
   local false_pos="${SECRETS_DIR}/false_positives.txt"
   local trufflehog_out="${SECRETS_DIR}/trufflehog_output.json"
+  local juicy_js="${SECRETS_DIR}/juicy_js_targets.txt"
 
   # Regex de falsos positivos comunes
   local FP_REGEX='example\.com|test|placeholder|changeme|yourapikey|your_key|INSERT_KEY|YOUR_TOKEN|REPLACE_ME|xxxx|1234567890|000000|aaaaaa|dummy|sample|foobar|lorem'
+  
+  # Regex para eliminar librerías conocidas (Anti-Librerías)
+  local LIB_REGEX='jquery|bootstrap|react|vue|angular|node_modules|wp-includes|wp-content|cdn|static|assets|libraries|vendor|third-party|framework|polyfill|analytics|gtag|facebook|google|twitter'
+  
+  # Regex para archivos jugosos (Juicy Files)
+  local JUICY_REGEX='api|config|admin|auth|v1|v2|user|setting|env|token|dashboard|panel|console|internal|backend|gateway|service|endpoint|graphql|swagger|openapi|key|secret|credential|jwt|bearer'
 
-  # SecretFinder sobre JS files
-  if command -v SecretFinder &>/dev/null && [[ -s "$js_urls" ]]; then
-    local js_count
-    js_count=$(wc -l < "$js_urls")
-    log_info "SecretFinder sobre ${js_count} archivos JS..."
-    > "$raw_secrets"
-    while IFS= read -r js_url; do
-      [[ -z "$js_url" ]] && continue
-      python3 SecretFinder.py -i "$js_url" -o cli 2>/dev/null >> "$raw_secrets" || true
-    done < "$js_urls"
-
-    # Filtrar falsos positivos
-    grep -viE "$FP_REGEX" "$raw_secrets" | sort -u > "$potential" 2>/dev/null || true
-    grep -iE  "$FP_REGEX" "$raw_secrets" | sort -u > "$false_pos"  2>/dev/null || true
-
-    log_ok "Secretos potenciales: $(wc -l < "$potential" 2>/dev/null || echo 0) → ${potential}"
-    log_ok "Falsos positivos filtrados: $(wc -l < "$false_pos" 2>/dev/null || echo 0) → ${false_pos}"
-  else
+  if ! command -v SecretFinder &>/dev/null; then
     log_skip "SecretFinder"
+  elif [[ ! -s "$js_urls" ]]; then
+    log_skip "Sin archivos JS para analizar"
+  else
+    local total_js
+    total_js=$(wc -l < "$js_urls")
+    log_info "Filtrando ${total_js} archivos JS..."
+
+    # Paso 1: Limpieza de ruido (Anti-Librerías)
+    log_info "  ▶ Eliminando librerías conocidas..."
+    grep -vEi "$LIB_REGEX" "$js_urls" 2>/dev/null > "${juicy_js}.tmp" || true
+    
+    # Paso 2: Priorización (Juicy Files)
+    log_info "  ▶ Filtrando archivos críticos de negocio..."
+    grep -Ei "$JUICY_REGEX" "${juicy_js}.tmp" 2>/dev/null > "$juicy_js" || true
+    
+    # Paso 3: Límite de archivos (máximo 40)
+    local before_limit
+    before_limit=$(wc -l < "$juicy_js" 2>/dev/null || echo 0)
+    if [[ $before_limit -gt 40 ]]; then
+      log_info "  ▶ Limitando a 40 archivos más prometedores (de ${before_limit})..."
+      head -40 "$juicy_js" > "${juicy_js}.tmp"
+      mv "${juicy_js}.tmp" "$juicy_js"
+    fi
+    
+    local final_count
+    final_count=$(wc -l < "$juicy_js" 2>/dev/null || echo 0)
+    log_ok "Archivos seleccionados: ${final_count}/${total_js}"
+
+    if [[ $final_count -eq 0 ]]; then
+      log_warn "No hay archivos JS prometedores para analizar"
+    else
+      # Sub-función para ejecución paralela
+      _analyze_js() {
+        local js_url="$1"
+        timeout 25s python3 SecretFinder.py -i "$js_url" -o cli 2>/dev/null || true
+      }
+      export -f _analyze_js
+
+      # Ejecución Paralela Controlada (Capturando el output de parallel directamente)
+      log_info "Analizando ${final_count} archivos con SecretFinder (5 hilos, 25s timeout)..."
+      
+      if command -v parallel &>/dev/null; then
+        # Dejamos que parallel gestione la salida limpia hacia el archivo
+        parallel --bar -j 5 _analyze_js :::: "$juicy_js" > "$raw_secrets" 2>/dev/null || true
+      else
+        # Fallback secuencial
+        > "$raw_secrets"
+        while IFS= read -r js_url; do
+          [[ -z "$js_url" ]] && continue
+          timeout 25s python3 SecretFinder.py -i "$js_url" -o cli 2>/dev/null >> "$raw_secrets" || true
+        done < "$juicy_js"
+      fi
+
+      # Filtrar falsos positivos
+      if [[ -s "$raw_secrets" ]]; then
+        grep -viE "$FP_REGEX" "$raw_secrets" | sort -u > "$potential" 2>/dev/null || true
+        grep -iE "$FP_REGEX" "$raw_secrets" | sort -u > "$false_pos" 2>/dev/null || true
+
+        log_ok "Secretos potenciales: $(wc -l < "$potential" 2>/dev/null || echo 0) → ${potential}"
+        log_ok "Falsos positivos filtrados: $(wc -l < "$false_pos" 2>/dev/null || echo 0) → ${false_pos}"
+      else
+        log_warn "Sin resultados de SecretFinder"
+        > "$potential"
+        > "$false_pos"
+      fi
+    fi
   fi
 
-  # TruffleHog
+  # Limpieza de archivos temporales (siempre se ejecuta)
+  rm -f "${juicy_js}.tmp"
+
+  # TruffleHog (sin cambios, ya está optimizado)
   if command -v trufflehog &>/dev/null; then
     log_info "TruffleHog sobre outputs del proyecto..."
     trufflehog filesystem "${PROJECT_DIR}/content" \
@@ -1052,7 +1111,7 @@ run_secrets() {
 }
 
 # ──────────────────────────────────────────────
-# M9 — CONTENT DISCOVERY (solo sobre high-priority hosts)
+# M9 — CONTENT DISCOVERY (Smart Fuzzing Local)
 # Respeta --skip-fuzz
 # ──────────────────────────────────────────────
 run_fuzzing() {
@@ -1063,13 +1122,27 @@ run_fuzzing() {
     return
   fi
 
-  local httpx_json="${HTTPX_DIR}/httpx_output.json"
-  local interesting_tech="${HTTPX_DIR}/httpx_interesting_tech.txt"
-  local login_panels="${HTTPX_DIR}/httpx_login_panels.txt"
-  local api_hosts="${HTTPX_DIR}/httpx_api_hosts.txt"
-  local error_hosts="${HTTPX_DIR}/httpx_errors.txt"
+  local fuzz_targets="${FUZZING_DIR}/fuzz_targets.txt"
+  
+  # 1. Construir lista de hosts a fuzzear: SOLO los más prometedores (Max 15)
+  cat "${HTTPX_DIR}/httpx_interesting_tech.txt" \
+      "${HTTPX_DIR}/httpx_login_panels.txt" \
+      "${HTTPX_DIR}/httpx_api_hosts.txt" \
+      "${HTTPX_DIR}/httpx_errors.txt" 2>/dev/null | sort -u | head -15 > "$fuzz_targets"
 
-  # Wordlist
+  local fuzz_count
+  fuzz_count=$(wc -l < "$fuzz_targets" 2>/dev/null || echo 0)
+
+  if [[ $fuzz_count -eq 0 ]]; then
+    log_warn "Sin hosts prioritarios. Usando top 5 activos..."
+    grep -oP 'https?://[^\s\[\]]+' "${HTTPX_DIR}/httpx_output.txt" 2>/dev/null | \
+      head -5 > "$fuzz_targets" || true
+    fuzz_count=$(wc -l < "$fuzz_targets" 2>/dev/null || echo 0)
+  fi
+
+  [[ $fuzz_count -eq 0 ]] && return
+
+  # 2. Selección de Wordlist
   local wl=""
   for candidate in \
     "/usr/share/seclists/Discovery/Web-Content/common.txt" \
@@ -1082,61 +1155,54 @@ run_fuzzing() {
     log_warn "Sin wordlist. Instala SecLists: sudo apt install seclists"
     return
   fi
-  log_info "Wordlist: $wl | threads=${FFUF_THREADS} rate=${FFUF_RATE}"
+  log_info "Wordlist: $(basename "$wl") | targets=${fuzz_count} | threads=${FFUF_THREADS}"
 
-  # Construir lista de hosts a fuzzear: SOLO los más prometedores
-  local fuzz_targets
-  fuzz_targets=$(mktemp)
-  cat "$interesting_tech" "$login_panels" "$api_hosts" "$error_hosts" \
-    2>/dev/null | sort -u | head -10 > "$fuzz_targets"
-
-  local fuzz_count
-  fuzz_count=$(wc -l < "$fuzz_targets")
-
-  if [[ $fuzz_count -eq 0 ]]; then
-    log_warn "Sin hosts prometedores para fuzzear. Usando los primeros 5 activos."
-    grep -oP 'https?://[^\s\[\]]+' "${HTTPX_DIR}/httpx_output.txt" 2>/dev/null | \
-      head -5 > "$fuzz_targets" || true
-    fuzz_count=$(wc -l < "$fuzz_targets")
-  fi
-
-  log_info "Fuzzeando ${fuzz_count} hosts (priorizados por tech/panel/API/error)"
-
-  while IFS= read -r host; do
-    [[ -z "$host" ]] && continue
+  # 3. Sub-función blindada para Fuzzing
+  _fuzz_host() {
+    local host="$1"
+    local wordlist="$2"
     local safe_name
     safe_name=$(echo "$host" | sed 's|https\?://||;s|/.*||;s|[^a-zA-Z0-9._-]|_|g')
 
     if command -v ffuf &>/dev/null; then
       local ffuf_out="${FUZZING_DIR}/ffuf_${safe_name}.json"
-      log_info "  [ffuf] → $host"
-      ffuf \
-        -w "$wl" -u "${host}/FUZZ" \
-        -mc 200,201,204,301,302,307,401,403,405,500 \
+      # -ac: Auto-calibración (Ignora catch-alls)
+      # -sa: Stop on errors (Si el WAF bloquea, aborta)
+      # timeout 15m: El seguro anti-zombis global
+      timeout 15m ffuf \
+        -w "$wordlist" -u "${host}/FUZZ" \
+        -mc 200,204,301,302,307,401,403,405,500 \
         -t "$FFUF_THREADS" -rate "$FFUF_RATE" \
-        -timeout 10 -silent \
-        -o "$ffuf_out" -of json \
-        2>/dev/null || true
+        -ac -sa -timeout 10 -silent \
+        -o "$ffuf_out" -of json 2>/dev/null || true
 
     elif command -v feroxbuster &>/dev/null; then
       local ferox_out="${FUZZING_DIR}/feroxbuster_${safe_name}.txt"
-      log_info "  [feroxbuster] → $host"
-      feroxbuster \
-        --url "$host" --wordlist "$wl" \
-        --status-codes 200,201,204,301,302,307,401,403,405,500 \
+      # --auto-tune y --auto-bail hacen lo mismo que -ac y -sa en ffuf
+      timeout 15m feroxbuster \
+        --url "$host" --wordlist "$wordlist" \
+        --status-codes 200,204,301,302,307,401,403,405,500 \
         --threads "$FFUF_THREADS" --rate-limit "$FFUF_RATE" \
-        --timeout 10 --silent \
-        --output "$ferox_out" --no-recursion \
-        2>/dev/null || true
-    else
-      log_skip "ffuf / feroxbuster"
-      rm -f "$fuzz_targets"
-      return
+        --auto-tune --auto-bail --no-recursion --silent \
+        --output "$ferox_out" 2>/dev/null || true
     fi
+  }
+  
+  # Exportar variables necesarias para sub-procesos de parallel
+  export -f _fuzz_host
+  export FFUF_THREADS FFUF_RATE FUZZING_DIR
 
-  done < "$fuzz_targets"
+  # 4. Ejecución Paralela Controlada (Max 2 hosts al mismo tiempo para no ahogar la red local)
+  if command -v parallel &>/dev/null; then
+    parallel --bar -j 2 _fuzz_host {} "$wl" :::: "$fuzz_targets" 2>/dev/null || true
+  else
+    while IFS= read -r host; do
+      [[ -z "$host" ]] && continue
+      _fuzz_host "$host" "$wl"
+    done < "$fuzz_targets"
+  fi
+
   rm -f "$fuzz_targets"
-
   log_ok "Content discovery completado → ${FUZZING_DIR}/"
 }
 
