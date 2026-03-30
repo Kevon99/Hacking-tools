@@ -38,14 +38,14 @@ RESET='\033[0m'
 # ──────────────────────────────────────────────
 banner() {
   echo -e "${CYAN}${BOLD}"
-  echo "  ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗"
-  echo "  ██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║"
-  echo "  ██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║"
-  echo "  ██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║"
-  echo "  ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║"
-  echo "  ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝"
-  echo -e "${RESET}${YELLOW}  Bug Bounty Recon Tool v3.0 — Full Optimized Pipeline${RESET}"
-  echo -e "${CYAN}  Attack Surface Scoring · Parallel Execution · Smart Prioritization${RESET}"
+  echo "  ██╗████████╗███████╗██╗  ██╗ ██████╗  █████╗ ████████╗██╗     "
+  echo "  ██║╚══██╔══╝╚══███╔╝██║ ██╔╝██╔═══██╗██╔══██╗╚══██╔══╝██║     "
+  echo "  ██║   ██║     ███╔╝ █████╔╝ ██║   ██║███████║   ██║   ██║     "
+  echo "  ██║   ██║    ███╔╝  ██╔═██╗ ██║   ██║██╔══██║   ██║   ██║     "
+  echo "  ██║   ██║   ███████╗██║  ██╗╚██████╔╝██║  ██║   ██║   ███████╗"
+  echo "  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝"
+  echo -e "${RESET}${RED}              OBSIDIAN RECON ENGINE v3.0 ${RESET}"
+  echo -e "${YELLOW}  Guadalajara Edition · Parallel Pipeline · Smart Scoring${RESET}"
   echo -e "${CYAN}  ─────────────────────────────────────────────────────────────────${RESET}"
   echo ""
 }
