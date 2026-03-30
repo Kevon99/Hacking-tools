@@ -44,11 +44,12 @@ banner() {
   echo "  ██║   ██║    ███╔╝  ██╔═██╗ ██║   ██║██╔══██║   ██║   ██║     "
   echo "  ██║   ██║   ███████╗██║  ██╗╚██████╔╝██║  ██║   ██║   ███████╗"
   echo "  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝"
-  echo -e "${RESET}${RED}              OBSIDIAN RECON ENGINE v3.0 ${RESET}"
-  echo -e "${YELLOW}  Guadalajara Edition · Parallel Pipeline · Smart Scoring${RESET}"
+  echo -e "${RESET}${RED}              DEIV_BLAZK Engine v3.0 ${RESET}"
+  echo -e "${YELLOW}  Bug Bounty Edition · Parallel Pipeline · Smart Scoring${RESET}"
   echo -e "${CYAN}  ─────────────────────────────────────────────────────────────────${RESET}"
   echo ""
 }
+
 
 # ──────────────────────────────────────────────
 # HELPERS
@@ -210,9 +211,9 @@ EOF
 # USAGE
 # ──────────────────────────────────────────────
 usage() {
-  echo -e "Uso: ${BOLD}bash recon.sh <proyect> [targets.txt] [out_scope.txt] [--normal|--stealth|--aggressive] [--skip-fuzz]${RESET}"
+  echo -e "Uso: ${BOLD}bash recon.sh <proyecto> [targets.txt] [out_scope.txt] [--normal|--stealth|--aggressive] [--skip-fuzz]${RESET}"
   echo ""
-  echo "  proyect        Nombre del programa (ej: acme)"
+  echo "  proyecto        Nombre del programa (ej: acme)"
   echo "  targets.txt     Un dominio raíz por línea. Si no se pasa, se pide interactivo"
   echo "  out_scope.txt   Dominios/URLs fuera de scope"
   echo "  --normal        Modo estándar (default)"
