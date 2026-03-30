@@ -297,6 +297,7 @@ run_subdomain_enum() {
   local output="${SUBFINDER_DIR}/subfinder_output.txt"
   local tmp_dir
   tmp_dir=$(mktemp -d)
+  export tmp_dir  # make tmp_dir available to GNU parallel child processes
   local pids=()
 
   _enum_domain() {
@@ -1112,6 +1113,9 @@ generate_report() {
   log_section "M12 — Generando reporte JSON"
   local report="${CONTENT_DIR}/recon_report.json"
 
+  # Función interna para contar líneas sin errores si el archivo no existe
+  safe_wc() { [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
+
   # Conteos
   local c_subdomains c_resolved c_active_hosts
   local c_wayback c_wayback_interesting
@@ -1119,23 +1123,23 @@ generate_report() {
   local c_high c_medium c_low c_idor c_api c_js c_new c_legacy
   local c_nuclei c_secrets
 
-  c_subdomains=$(wc -l < "${SUBFINDER_DIR}/subfinder_output.txt"   2>/dev/null || echo 0)
-  c_resolved=$(wc -l   < "${DNSX_DIR}/dnsx_resolved.txt"           2>/dev/null || echo 0)
-  c_active_hosts=$(wc -l < "${HTTPX_DIR}/httpx_output.txt"         2>/dev/null || echo 0)
-  c_wayback=$(wc -l    < "${WAYBACK_DIR}/wayback_output.txt"        2>/dev/null || echo 0)
-  c_wayback_interesting=$(wc -l < "${WAYBACK_DIR}/wayback_interesting.txt" 2>/dev/null || echo 0)
-  c_katana=$(wc -l     < "${KATANA_DIR}/katana_output.txt"          2>/dev/null || echo 0)
-  c_katana_interesting=$(wc -l < "${KATANA_DIR}/katana_interesting.txt"   2>/dev/null || echo 0)
-  c_high=$(wc -l       < "${SCORING_DIR}/high_priority.txt"         2>/dev/null || echo 0)
-  c_medium=$(wc -l     < "${SCORING_DIR}/medium_priority.txt"       2>/dev/null || echo 0)
-  c_low=$(wc -l        < "${SCORING_DIR}/low_priority.txt"          2>/dev/null || echo 0)
-  c_idor=$(wc -l       < "${SCORING_DIR}/idor_candidates.txt"       2>/dev/null || echo 0)
-  c_api=$(wc -l        < "${SCORING_DIR}/api_endpoints.txt"         2>/dev/null || echo 0)
-  c_js=$(wc -l         < "${SCORING_DIR}/js_files.txt"              2>/dev/null || echo 0)
-  c_new=$(wc -l        < "${SCORING_DIR}/new_endpoints.txt"         2>/dev/null || echo 0)
-  c_legacy=$(wc -l     < "${SCORING_DIR}/legacy_endpoints.txt"      2>/dev/null || echo 0)
-  c_nuclei=$(wc -l     < "${NUCLEI_DIR}/nuclei_output.txt"          2>/dev/null || echo 0)
-  c_secrets=$(wc -l    < "${SECRETS_DIR}/potential_secrets.txt"     2>/dev/null || echo 0)
+  c_subdomains=$(safe_wc "${SUBFINDER_DIR}/subfinder_output.txt")
+  c_resolved=$(safe_wc "${DNSX_DIR}/dnsx_resolved.txt")
+  c_active_hosts=$(safe_wc "${HTTPX_DIR}/httpx_output.txt")
+  c_wayback=$(safe_wc "${WAYBACK_DIR}/wayback_output.txt")
+  c_wayback_interesting=$(safe_wc "${WAYBACK_DIR}/wayback_interesting.txt")
+  c_katana=$(safe_wc "${KATANA_DIR}/katana_output.txt")
+  c_katana_interesting=$(safe_wc "${KATANA_DIR}/katana_interesting.txt")
+  c_high=$(safe_wc "${SCORING_DIR}/high_priority.txt")
+  c_medium=$(safe_wc "${SCORING_DIR}/medium_priority.txt")
+  c_low=$(safe_wc "${SCORING_DIR}/low_priority.txt")
+  c_idor=$(safe_wc "${SCORING_DIR}/idor_candidates.txt")
+  c_api=$(safe_wc "${SCORING_DIR}/api_endpoints.txt")
+  c_js=$(safe_wc "${SCORING_DIR}/js_files.txt")
+  c_new=$(safe_wc "${SCORING_DIR}/new_endpoints.txt")
+  c_legacy=$(safe_wc "${SCORING_DIR}/legacy_endpoints.txt")
+  c_nuclei=$(safe_wc "${NUCLEI_DIR}/nuclei_output.txt")
+  c_secrets=$(safe_wc "${SECRETS_DIR}/potential_secrets.txt")
 
   # Targets + OOS JSON
   local targets_json outscope_json="null" outscope_applied="false"
