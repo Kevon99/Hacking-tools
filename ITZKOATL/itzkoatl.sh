@@ -20,7 +20,84 @@
 #    bash recon.sh <proyecto> [targets.txt] [out_scope.txt] [--normal|--stealth|--aggressive]
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
+# Nota: eliminamos -e intencionalmente para que Ctrl+C no mate
+# subprocesos en mitad de una escritura y deje archivos de 0 bytes.
+# Cada función maneja sus propios errores con || true.
+
+# ──────────────────────────────────────────────
+# TRAP SIGINT — Ctrl+C guarda lo que hay y sale limpio
+# ──────────────────────────────────────────────
+_INTERRUPTED=0
+_TMP_DIRS=()   # registro global de tmpdir para limpiar en trap
+
+_cleanup_and_exit() {
+  # Evitar doble ejecución si el trap se dispara varias veces
+  [[ $_INTERRUPTED -eq 1 ]] && return
+  _INTERRUPTED=1
+
+  echo ""
+  echo -e "\n${YELLOW}[!]${RESET} Interrupción detectada — guardando progreso y saliendo limpio..."
+
+  # Matar procesos hijos incluyendo katana que puede quedar zombie
+  local child_pids
+  child_pids=$(jobs -p 2>/dev/null || true)
+  [[ -n "$child_pids" ]] && kill -TERM $child_pids 2>/dev/null || true
+  
+  # Matar específicamente procesos katana que pueden quedar zombie
+  pkill -f katana 2>/dev/null || true
+  pkill -f "timeout.*katana" 2>/dev/null || true
+  
+  # Esperar un momento para que los procesos terminen limpiamente
+  sleep 2
+  
+  # Forzar kill si aún hay procesos restantes
+  child_pids=$(jobs -p 2>/dev/null || true)
+  [[ -n "$child_pids" ]] && kill -KILL $child_pids 2>/dev/null || true
+
+  # Limpiar tmpdirs registrados (nunca dejan archivos de 0 bytes en el proyecto)
+  for d in "${_TMP_DIRS[@]:-}"; do
+    [[ -d "$d" ]] && rm -rf "$d"
+  done
+
+  # Consolidar lo que ya se escribió en los tmpdir de M1/M5
+  # (la función _flush_partial_results la llamamos antes de salir)
+  _flush_partial_results 2>/dev/null || true
+
+  # Mostrar lo que se salvó
+  if [[ -n "${SUBFINDER_DIR:-}" && -s "${SUBFINDER_DIR}/subfinder_output.txt" ]]; then
+    local saved
+    saved=$(wc -l < "${SUBFINDER_DIR}/subfinder_output.txt")
+    echo -e "${GREEN}[✔]${RESET} Subdominios guardados hasta ahora: ${saved} → ${SUBFINDER_DIR}/subfinder_output.txt"
+  fi
+  if [[ -n "${HTTPX_DIR:-}" && -s "${HTTPX_DIR}/httpx_output.txt" ]]; then
+    local saved
+    saved=$(wc -l < "${HTTPX_DIR}/httpx_output.txt")
+    echo -e "${GREEN}[✔]${RESET} Hosts activos guardados: ${saved} → ${HTTPX_DIR}/httpx_output.txt"
+  fi
+
+  echo -e "${CYAN}[*]${RESET} Puedes reanudar el pipeline manualmente desde donde quedó."
+  exit 130  # convención: 128 + SIGINT(2)
+}
+
+trap '_cleanup_and_exit' INT TERM
+
+# Hook para consolidar archivos temporales parciales en M1/M5
+# Se llama tanto al final normal como en el trap
+_flush_partial_results() {
+  # M1: si hay tmpdir activo de enum, merge lo que haya
+  if [[ -n "${_M1_TMPDIR:-}" && -d "${_M1_TMPDIR:-}" ]]; then
+    local out="${SUBFINDER_DIR}/subfinder_output.txt"
+    cat "${_M1_TMPDIR}"/*.txt 2>/dev/null | sort -u >> "$out" || true
+    sort -u "$out" -o "$out" 2>/dev/null || true
+  fi
+  # M5: si hay tmpdir activo de wayback, merge lo que haya
+  if [[ -n "${_M5_TMPDIR:-}" && -d "${_M5_TMPDIR:-}" ]]; then
+    local out="${WAYBACK_DIR}/wayback_output.txt"
+    cat "${_M5_TMPDIR}"/*.txt 2>/dev/null | sort -u >> "$out" || true
+    sort -u "$out" -o "$out" 2>/dev/null || true
+  fi
+}
 
 # ──────────────────────────────────────────────
 # COLORES
@@ -66,26 +143,19 @@ log_section() {
 
 # Filtrar un archivo contra out_scope
 filter_file() {
-  local target_file="$1" outscope_file="$2" backup_file="$3"
-  [[ ! -s "$target_file" ]] && return
-  [[ ! -f "$outscope_file" ]] && return
-  local before after removed tmp
-  before=$(wc -l < "$target_file")
-  tmp=$(mktemp)
-  cp "$target_file" "$tmp"
-  while IFS= read -r oos; do
-    [[ -z "$oos" ]] && continue
-    local escaped
-    escaped=$(printf '%s' "$oos" | sed 's/[.[\*^${}()+?|]/\\&/g')
-    grep -viE "$escaped" "$tmp" > "${tmp}.new" 2>/dev/null || true
-    mv "${tmp}.new" "$tmp"
-  done < "$outscope_file"
-  cp "$target_file" "$backup_file"
-  cp "$tmp" "$target_file"
-  rm -f "$tmp"
-  after=$(wc -l < "$target_file")
-  removed=$(( before - after ))
-  log_ok "$(basename "$target_file"): -${removed} OOS → ${after} restantes"
+  local file="$1"
+  [[ ! -f "$file" ]] && return
+  [[ ! -f "$INPUT_OUTSCOPE_FILE" ]] && return
+
+  local tmp_filter
+  tmp_filter=$(mktemp)
+  
+  # -v (invertir), -F (string fijo), -f (leer patrones del archivo de out-scope)
+  if grep -vFf "$INPUT_OUTSCOPE_FILE" "$file" > "$tmp_filter" 2>/dev/null; then
+      mv "$tmp_filter" "$file"
+  else
+      rm -f "$tmp_filter"
+  fi
 }
 
 # Array JSON muestreado (máx N líneas)
@@ -289,57 +359,81 @@ collect_targets() {
 
 # ──────────────────────────────────────────────
 # M1 — ENUMERACIÓN DE SUBDOMINIOS (PARALELO)
-# Cada dominio se procesa con subfinder+assetfinder+amass en background
-# Se controla el número de procesos simultáneos con PARALLEL_JOBS
+# - subfinder + assetfinder con timeout por herramienta
+# - amass SOLO en modo --aggressive (demasiado lento para uso diario)
+# - GNU parallel con --bar para visibilidad
+# - Sin parallel: logs en tiempo real por dominio
+# - Registra _M1_TMPDIR para el trap de SIGINT
 # ──────────────────────────────────────────────
 run_subdomain_enum() {
   log_section "M1 — Enumeración de subdominios (paralelo, jobs=${PARALLEL_JOBS})"
   local output="${SUBFINDER_DIR}/subfinder_output.txt"
-  local tmp_dir
-  tmp_dir=$(mktemp -d)
-  export tmp_dir  # make tmp_dir available to GNU parallel child processes
-  local pids=()
+  _M1_TMPDIR=$(mktemp -d)
+  _TMP_DIRS+=("$_M1_TMPDIR")
+  export _M1_TMPDIR
+
+  # Timeouts por herramienta (en segundos)
+  local T_SUBFINDER=120   # 2 min máx por dominio
+  local T_ASSETFINDER=60  # 1 min máx
+  local T_AMASS=300       # 5 min máx (solo aggressive)
 
   _enum_domain() {
     local domain="$1"
-    local out="${tmp_dir}/${domain//\//_}.txt"
+    local out="${_M1_TMPDIR}/${domain//\//_}.txt"
     > "$out"
-    # subfinder (crítico)
-    subfinder -d "$domain" -silent 2>/dev/null >> "$out" || true
-    # assetfinder (opcional)
+
+    # Subfinder: rápido y efectivo (3 min máximo)
+    timeout 3m subfinder -d "$domain" -all -silent 2>/dev/null >> "$out" || true
+    
+    # Assetfinder: casi instantáneo
     if command -v assetfinder &>/dev/null; then
       assetfinder --subs-only "$domain" 2>/dev/null >> "$out" || true
     fi
-    # amass (opcional)
-    if command -v amass &>/dev/null; then
-      amass enum -passive -d "$domain" -silent 2>/dev/null >> "$out" || true
+
+    # AMASS: Solo si el modo es AGGRESSIVE, si no, se salta (es el que traba todo)
+    if [[ "${RECON_MODE}" == "aggressive" ]]; then
+      if command -v amass &>/dev/null; then
+        timeout 7m amass enum -passive -d "$domain" -silent 2>/dev/null >> "$out" || true
+      fi
     fi
   }
   export -f _enum_domain
+  export RECON_MODE T_SUBFINDER T_ASSETFINDER T_AMASS
 
-  # Lanzar con GNU parallel si está disponible, sino con & y wait manual
   if command -v parallel &>/dev/null; then
-    log_info "Usando GNU parallel (${PARALLEL_JOBS} jobs)"
-    parallel -j "${PARALLEL_JOBS}" _enum_domain ::: $(cat "$TARGETS_FILE") 2>/dev/null || true
+    log_info "GNU parallel --bar (${PARALLEL_JOBS} jobs)${RECON_MODE:+ | modo: $RECON_MODE}"
+    # --bar: barra de progreso interactiva en terminal
+    # --line-buffer: los logs de cada herramienta aparecen en tiempo real
+    parallel --bar --line-buffer -j "${PARALLEL_JOBS}" _enum_domain :::: "${TARGETS_FILE}" 2>&1 || true
   else
-    log_info "Usando jobs en background (sin GNU parallel)"
+    log_info "Modo background manual (${PARALLEL_JOBS} jobs max)"
+    local pids=() domain_names=()
     while IFS= read -r domain; do
       [[ -z "$domain" ]] && continue
-      log_info "  → $domain"
+      log_info "  ▶ ${domain} (subfinder+assetfinder${RECON_MODE:+, amass en aggressive})"
       _enum_domain "$domain" &
       pids+=($!)
-      # Limitar procesos simultáneos
+      domain_names+=("$domain")
+
       if [[ ${#pids[@]} -ge $PARALLEL_JOBS ]]; then
-        wait "${pids[0]}"
+        # Esperar el slot más antiguo y loguear cuándo termina
+        wait "${pids[0]}" 2>/dev/null || true
+        log_ok "  ✔ ${domain_names[0]} completado"
         pids=("${pids[@]:1}")
+        domain_names=("${domain_names[@]:1}")
       fi
     done < "$TARGETS_FILE"
-    wait
+    # Esperar todos los restantes
+    for i in "${!pids[@]}"; do
+      wait "${pids[$i]}" 2>/dev/null || true
+      log_ok "  ✔ ${domain_names[$i]} completado"
+    done
   fi
 
-  # Merge + dedup de todos los archivos temporales
-  cat "${tmp_dir}"/*.txt 2>/dev/null | sort -u > "$output" || true
-  rm -rf "$tmp_dir"
+  # Merge + dedup
+  cat "${_M1_TMPDIR}"/*.txt 2>/dev/null | sort -u > "$output" || true
+  rm -rf "$_M1_TMPDIR"
+  _M1_TMPDIR=""
 
   log_ok "Subdominios únicos: $(wc -l < "$output" 2>/dev/null || echo 0) → ${output}"
 }
@@ -375,7 +469,7 @@ run_dnsx() {
 # M3 — WAFW00F: detectar WAF → preguntar si forzar stealth
 # ──────────────────────────────────────────────
 run_wafw00f() {
-  log_section "M3 — WAF Detection (wafw00f)"
+  log_section "M3 — Detección de WAF (Muestreo)"
 
   if ! command -v wafw00f &>/dev/null; then
     log_skip "wafw00f"
@@ -383,40 +477,33 @@ run_wafw00f() {
     return
   fi
 
-  local input="${SUBFINDER_DIR}/subfinder_output.txt"
-  local output="${WAFW00F_DIR}/wafw00f_output.txt"
-  local waf_list="${WAFW00F_DIR}/waf_detected.txt"
+  local output="${WAFW00F_DIR}/waf_report.txt"
 
-  [[ ! -s "$input" ]] && { WAF_DETECTED="unknown"; return; }
+  [[ ! -s "$TARGETS_FILE" ]] && { WAF_DETECTED="unknown"; return; }
 
-  log_info "Detectando WAF en $(wc -l < "$input") hosts..."
-  wafw00f -i "$input" -o "$output" 2>/dev/null || true
-  grep -v "No WAF detected\|Generic\|not detected" "$output" \
-    > "$waf_list" 2>/dev/null || true
+  log_info "Detectando WAF en dominios principales..."
+  # Probamos solo los dominios principales, no todos los subdominios
+  wafw00f -i "${TARGETS_FILE}" -o "$output" > /dev/null 2>&1
 
-  local waf_count
-  waf_count=$(wc -l < "$waf_list" 2>/dev/null || echo 0)
+  if grep -qi "is behind" "$output" 2>/dev/null; then
+      WAF_DETECTED="yes"
+      log_warn "WAF detectado en los dominios principales."
 
-  if [[ $waf_count -gt 0 ]]; then
-    WAF_DETECTED="yes"
-    log_warn "WAF detectado en ${waf_count} hosts:"
-    head -5 "$waf_list" | while IFS= read -r l; do log_warn "    $l"; done
-
-    if [[ "${RECON_MODE}" != "stealth" ]]; then
-      echo ""
-      log_warn "Modo actual: ${RECON_MODE}. El WAF puede bloquearte."
-      read -rp "  ¿Cambiar a modo STEALTH? [s/N]: " switch
-      if [[ "$switch" =~ ^[sS]$ ]]; then
-        RECON_MODE="stealth"
-        set_mode_config
-        log_ok "Modo cambiado a STEALTH"
-      else
-        log_warn "Continuando en modo ${RECON_MODE}. Riesgo de bloqueo."
+      if [[ "${RECON_MODE}" != "stealth" ]]; then
+        echo ""
+        log_warn "Modo actual: ${RECON_MODE}. El WAF puede bloquearte."
+        read -rp "  ¿Cambiar a modo STEALTH? [s/N]: " switch
+        if [[ "$switch" =~ ^[sS]$ ]]; then
+          RECON_MODE="stealth"
+          set_mode_config
+          log_ok "Modo cambiado a STEALTH"
+        else
+          log_warn "Continuando en modo ${RECON_MODE}. Riesgo de bloqueo."
+        fi
       fi
-    fi
   else
-    WAF_DETECTED="no"
-    log_ok "Sin WAF detectado"
+      WAF_DETECTED="no"
+      log_ok "Sin WAF detectado"
   fi
 }
 
@@ -490,7 +577,10 @@ _classify_httpx_hosts() {
 
 # ──────────────────────────────────────────────
 # M5 — GAU + WAYBACKURLS (por DOMINIO RAÍZ, paralelo)
-# Se deduplica antes de pasar a katana
+# - Límite de URLs por dominio para evitar GB de datos en e-commerce
+# - Timeout por herramienta para evitar bloqueos infinitos
+# - GNU parallel con --bar para visibilidad
+# - Registra _M5_TMPDIR para el trap de SIGINT
 # ──────────────────────────────────────────────
 run_wayback() {
   log_section "M5 — URLs Históricas (gau + waybackurls, por dominio raíz)"
@@ -500,7 +590,7 @@ run_wayback() {
 
   [[ ! -s "$httpx_file" ]] && { log_warn "httpx vacío. Saltando."; touch "$output"; return; }
 
-  # Extraer SOLO dominios raíz únicos (evitar 50 subdominos del mismo dominio)
+  # Extraer SOLO dominios raíz únicos
   local root_domains
   root_domains=$(grep -oP 'https?://[^\s\[\]]+' "$httpx_file" 2>/dev/null | \
     sed 's|https\?://||' | awk -F'/' '{print $1}' | \
@@ -508,59 +598,85 @@ run_wayback() {
     sort -u)
 
   local root_count
-  root_count=$(echo "$root_domains" | grep -c . || echo 0)
+  root_count=$(echo "$root_domains" | grep -c . 2>/dev/null || echo 0)
   log_info "Dominios raíz únicos: ${root_count} (de $(wc -l < "$httpx_file") hosts activos)"
 
-  local tmp_dir
-  tmp_dir=$(mktemp -d)
+  _M5_TMPDIR=$(mktemp -d)
+  _TMP_DIRS+=("$_M5_TMPDIR")
+  export _M5_TMPDIR
+
+  # Límites según modo para evitar descarga de GBs en e-commerce gigantes
+  local GAU_LIMIT WAYBACK_LIMIT T_GAU T_WAYBACK
+  case "${RECON_MODE}" in
+    stealth)
+      GAU_LIMIT=2000;   WAYBACK_LIMIT=2000
+      T_GAU=60;         T_WAYBACK=60   ;;
+    aggressive)
+      GAU_LIMIT=50000;  WAYBACK_LIMIT=50000
+      T_GAU=300;        T_WAYBACK=300  ;;
+    *)
+      GAU_LIMIT=10000;  WAYBACK_LIMIT=10000
+      T_GAU=120;        T_WAYBACK=120  ;;
+  esac
+  export GAU_LIMIT WAYBACK_LIMIT T_GAU T_WAYBACK
 
   _fetch_wayback() {
     local domain="$1"
-    local out="${tmp_dir}/${domain//\//_}.txt"
-    > "$out"
+    local out="${_M5_TMPDIR}/${domain//\//_}.txt"
+    
+    # Máximo 5 minutos por dominio para traer URLs históricas
     if command -v gau &>/dev/null; then
-      echo "$domain" | gau \
-        --blacklist png,jpg,gif,svg,woff,ttf,eot,ico,css,mp4,mp3,zip,pdf \
-        2>/dev/null >> "$out" || true
+      timeout 5m echo "$domain" | gau --subs --threads 10 2>/dev/null >> "$out" || true
     fi
+    
     if command -v waybackurls &>/dev/null; then
-      echo "$domain" | waybackurls 2>/dev/null >> "$out" || true
+      timeout 5m echo "$domain" | waybackurls 2>/dev/null >> "$out" || true
     fi
   }
   export -f _fetch_wayback
 
   if command -v parallel &>/dev/null; then
-    echo "$root_domains" | parallel -j "${PARALLEL_JOBS}" _fetch_wayback 2>/dev/null || true
+    log_info "GNU parallel --bar | límite: gau=${GAU_LIMIT} wayback=${WAYBACK_LIMIT} URLs/dominio"
+    echo "$root_domains" | \
+      parallel --bar --line-buffer -j "${PARALLEL_JOBS}" \
+      _fetch_wayback 2>&1 || true
   else
-    local pids=()
+    log_info "Background manual | límite: gau=${GAU_LIMIT} wayback=${WAYBACK_LIMIT} URLs/dominio"
+    local pids=() domain_names=()
     while IFS= read -r domain; do
       [[ -z "$domain" ]] && continue
-      log_info "  → $domain"
+      log_info "  ▶ ${domain}"
       _fetch_wayback "$domain" &
       pids+=($!)
+      domain_names+=("$domain")
       if [[ ${#pids[@]} -ge $PARALLEL_JOBS ]]; then
-        wait "${pids[0]}"; pids=("${pids[@]:1}")
+        wait "${pids[0]}" 2>/dev/null || true
+        log_ok "  ✔ ${domain_names[0]} completado"
+        pids=("${pids[@]:1}")
+        domain_names=("${domain_names[@]:1}")
       fi
     done <<< "$root_domains"
-    wait
+    for i in "${!pids[@]}"; do
+      wait "${pids[$i]}" 2>/dev/null || true
+      log_ok "  ✔ ${domain_names[$i]} completado"
+    done
   fi
 
   # Merge + dedup global
-  cat "${tmp_dir}"/*.txt 2>/dev/null | sort -u > "$output" || true
-  rm -rf "$tmp_dir"
+  cat "${_M5_TMPDIR}"/*.txt 2>/dev/null | sort -u > "$output" || true
+  rm -rf "$_M5_TMPDIR"
+  _M5_TMPDIR=""
 
-  # Filtrar extensiones sin valor antes de guardar
-  local cleaned
-  cleaned=$(grep -viE "\.(png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|css|mp4|mp3|zip|pdf|tar|gz)(\?|$)" \
-    "$output" 2>/dev/null | sort -u || true)
-  echo "$cleaned" > "$output"
+  # Filtrar extensiones sin valor
+  grep -viE "\.(png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|css|mp4|mp3|zip|pdf|tar|gz)(\?|$)" \
+    "$output" 2>/dev/null | sort -u > "${output}.clean" && mv "${output}.clean" "$output" || true
 
   # URLs interesantes
   grep -iE "\.(php|asp|aspx|jsp|json|xml|env|config|bak|sql|log|git|yaml|yml|toml)\b|\?(.*=)" \
     "$output" | sort -u > "$output_interesting" 2>/dev/null || true
 
-  log_ok "URLs históricas (dedup, sin estáticos): $(wc -l < "$output")"
-  log_ok "URLs interesantes: $(wc -l < "$output_interesting")"
+  log_ok "URLs históricas (dedup, sin estáticos): $(wc -l < "$output" 2>/dev/null || echo 0)"
+  log_ok "URLs interesantes: $(wc -l < "$output_interesting" 2>/dev/null || echo 0)"
 }
 
 # ──────────────────────────────────────────────
@@ -632,7 +748,16 @@ run_katana() {
   # Extensiones a excluir
   local exclude_ext="png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot,ico,css,mp4,mp3,zip,pdf,tar,gz,webp"
 
-  katana \
+  # Timeout global para katana según modo
+  local T_KATANA
+  case "${RECON_MODE}" in
+    stealth)    T_KATANA=600  ;;   # 10 min máx
+    aggressive) T_KATANA=3600 ;;   # 1 hora
+    *)          T_KATANA=1200 ;;   # 20 min
+  esac
+  log_info "Timeout katana: ${T_KATANA}s"
+
+  timeout "${T_KATANA}" katana \
     -list "$input_file" \
     -depth "$KATANA_DEPTH" \
     -js-crawl \
@@ -1031,13 +1156,13 @@ filter_out_scope() {
   sed -i '/^[[:space:]]*$/d' "$oos"
   log_info "$(wc -l < "$oos") entradas OOS"
 
-  filter_file "${SUBFINDER_DIR}/subfinder_output.txt"     "$oos" "${SUBFINDER_DIR}/subfinder_output_unfiltered.txt"
-  filter_file "${HTTPX_DIR}/httpx_output.txt"             "$oos" "${HTTPX_DIR}/httpx_output_unfiltered.txt"
-  filter_file "${WAYBACK_DIR}/wayback_output.txt"         "$oos" "${WAYBACK_DIR}/wayback_output_unfiltered.txt"
-  filter_file "${KATANA_DIR}/katana_output.txt"           "$oos" "${KATANA_DIR}/katana_output_unfiltered.txt"
-  filter_file "${SCORING_DIR}/high_priority.txt"          "$oos" "${SCORING_DIR}/high_priority_unfiltered.txt"
-  filter_file "${SCORING_DIR}/idor_candidates.txt"        "$oos" "${SCORING_DIR}/idor_candidates_unfiltered.txt"
-  filter_file "${SCORING_DIR}/api_endpoints.txt"          "$oos" "${SCORING_DIR}/api_endpoints_unfiltered.txt"
+  filter_file "${SUBFINDER_DIR}/subfinder_output.txt"
+  filter_file "${HTTPX_DIR}/httpx_output.txt"
+  filter_file "${WAYBACK_DIR}/wayback_output.txt"
+  filter_file "${KATANA_DIR}/katana_output.txt"
+  filter_file "${SCORING_DIR}/high_priority.txt"
+  filter_file "${SCORING_DIR}/idor_candidates.txt"
+  filter_file "${SCORING_DIR}/api_endpoints.txt"
 
   log_ok "Filtro OOS completado"
 }
@@ -1258,6 +1383,9 @@ main() {
   RECON_MODE="normal"
   SKIP_FUZZ="false"
   WAF_DETECTED="unknown"
+  _M1_TMPDIR=""
+  _M5_TMPDIR=""
+  _TMP_DIRS=()
 
   # Parsear flags desde cualquier posición
   for arg in "$@"; do
