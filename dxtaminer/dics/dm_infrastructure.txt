@@ -1,0 +1,16 @@
+.s3.amazonaws.com
+.blob.core.windows.net
+.gcs.
+.cloudfront.net
+169.254.169.254     
+127.0.0.1
+localhost:
+internal.
+staging.
+dev-api.
+test.
+jenkins.
+.git/config
+.env
+docker-compose
+kubernetes.
