@@ -28,7 +28,7 @@ class DXtaMiner:
     
     def __init__(self, data_file: Path, wordlist_file: Path):
         """
-        Initialize DXtMiner with data and wordlist files
+        Initialize DXtaMiner with data and wordlist files
         
         Args:
             data_file: Path to the massive data file
@@ -232,7 +232,7 @@ def compile_regex_engine():
         'ipv4': '192.168.1.1'
     }
     
-    miner = DXtMiner(Path("dummy"), Path("dummy"))
+    miner = DXtaMiner(Path("dummy"), Path("dummy"))
     
     for pattern_name, pattern in miner.AUTO_RECON_PATTERNS.items():
         test_value = test_cases.get(pattern_name, '')
@@ -251,8 +251,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 dxtminer.py -d massive_log.txt -w secrets.txt
-  python3 dxtminer.py -d /path/to/data.log -w /path/to/wordlist.txt
+  python3 dxtaminer.py -d massive_log.txt -w secrets.txt
+  python3 dxtaminer.py -d /path/to/data.log -w /path/to/wordlist.txt
         """
     )
     
@@ -293,7 +293,7 @@ Examples:
         sys.exit(1)
     
     # Initialize and run miner
-    miner = DXtMiner(args.data, args.wordlist)
+    miner = DXtaMiner(args.data, args.wordlist)
     
     try:
         miner.load_wordlist()
