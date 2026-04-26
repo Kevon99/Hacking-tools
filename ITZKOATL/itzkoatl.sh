@@ -110,23 +110,31 @@ MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
+PURPLE='\033[0;35m'           # Morado oscuro
+BRIGHT_MAGENTA='\033[1;35m'   # Morado brillante
+BRIGHT_RED='\033[1;31m'       # Rojo brillante
+DARK_RED='\033[0;31m'         # Rojo oscuro
+NEON_PURPLE='\033[38;5;135m'  # Morado neón (256 colors)
+NEON_RED='\033[38;5;196m'     # Rojo neón (256 colors)
+HACKER_PRIMARY='\033[38;5;135m'     # Morado oscuro neón
+HACKER_SECONDARY='\033[38;5;196m'   # Rojo brillante neón
+
 # ──────────────────────────────────────────────
-# BANNER
+# BANNER 
 # ──────────────────────────────────────────────
 banner() {
-  echo -e "${CYAN}${BOLD}"
+  echo -e "${HACKER_PRIMARY}${BOLD}"
   echo "  ██╗████████╗███████╗██╗  ██╗ ██████╗  █████╗ ████████╗██╗     "
   echo "  ██║╚══██╔══╝╚══███╔╝██║ ██╔╝██╔═══██╗██╔══██╗╚══██╔══╝██║     "
   echo "  ██║   ██║     ███╔╝ █████╔╝ ██║   ██║███████║   ██║   ██║     "
   echo "  ██║   ██║    ███╔╝  ██╔═██╗ ██║   ██║██╔══██║   ██║   ██║     "
   echo "  ██║   ██║   ███████╗██║  ██╗╚██████╔╝██║  ██║   ██║   ███████╗"
   echo "  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝"
-  echo -e "${RESET}${RED}              OBSIDIAN RECON ENGINE v3.0 ${RESET}"
-  echo -e "${YELLOW}  Guadalajara Edition · Parallel Pipeline · Smart Scoring${RESET}"
-  echo -e "${CYAN}  ─────────────────────────────────────────────────────────────────${RESET}"
+  echo -e "${RESET}${BRIGHT_RED}${BOLD}              Made By Deiv_Blazk / Kevon99 ${RESET}"
+  echo -e "${HACKER_SECONDARY}  <https://github.com/Kevon99/Hacking-tools/tree/master/ITZKOATL>${RESET}"
+  echo -e "${HACKER_PRIMARY}  ─────────────────────────────────────────────────────────────────${RESET}"
   echo ""
 }
-
 # ──────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────
@@ -212,7 +220,7 @@ set_mode_config() {
       RATE=50
       KATANA_DEPTH=3
       KATANA_MAX_URLS=200
-      NUCLEI_THREADS=25
+      NUCLEI_THREADS=15
       NUCLEI_RATE=150
       FFUF_THREADS=40
       FFUF_RATE=100
@@ -873,13 +881,13 @@ except:
 # Regexes de scoring
 IDOR_PARAMS = re.compile(
     r'[?&](id|user|user_id|account|account_id|wallet|transaction|order|order_id|'
-    r'profile|basket|cart|uuid|token|uid|pid|cid|tid|ref|invoice)=[0-9a-f\-]{1,}',
+    r'profile|basket|cart|uuid|token|uid|pid|cid|tid|key|ref|invoice)=[0-9a-f\-]{1,}',
     re.IGNORECASE
 )
 SENSITIVE_PATH = re.compile(
     r'/(api|v[0-9]+|graphql|admin|panel|dashboard|login|auth|oauth|internal|'
     r'upload|download|export|import|backup|config|debug|test|swagger|openapi|'
-    r'manage|management|cms|wp-admin|wp-json|actuator|metrics|health|env)',
+    r'manage|management|cms|wp-admin|cms|api|v1|v2|v3|console|docker|wp-json|actuator|metrics|health|env)',
     re.IGNORECASE
 )
 DANGEROUS_EXT = re.compile(r'\.(php|asp|aspx|jsp|do|action|cfm|cgi|pl|py|rb)(\?|$)', re.IGNORECASE)
@@ -996,118 +1004,271 @@ PYEOF
 }
 
 # ──────────────────────────────────────────────
-# M8 — SECRET DISCOVERY (con filtro de falsos positivos)
+# M8 — SECRET DISCOVERY 
+# Combinación de múltiples técnicas:
+#   1. gf patterns (rápido, patrones conocidos)
+#   2. TruffleHog sobre URLs descargadas
+#   3. Análisis de responses HTTP (headers + body)
+#   4. strings + ripgrep en archivos JS
+#   5. Filtro avanzado de falsos positivos
 # ──────────────────────────────────────────────
+
 run_secrets() {
-  log_section "M8 — Secret Discovery (Calidad sobre Cantidad)"
+  log_section "M8 — Secret Discovery (Multi-técnica, Ultra-Eficiente)"
+  
   local js_urls="${SCORING_DIR}/js_files.txt"
-  local raw_secrets="${SECRETS_DIR}/secrets_raw.txt"
-  local potential="${SECRETS_DIR}/potential_secrets.txt"
-  local false_pos="${SECRETS_DIR}/false_positives.txt"
-  local trufflehog_out="${SECRETS_DIR}/trufflehog_output.json"
-  local juicy_js="${SECRETS_DIR}/juicy_js_targets.txt"
-
-  # Regex de falsos positivos comunes
-  local FP_REGEX='example\.com|test|placeholder|changeme|yourapikey|your_key|INSERT_KEY|YOUR_TOKEN|REPLACE_ME|xxxx|1234567890|000000|aaaaaa|dummy|sample|foobar|lorem'
+  local api_urls="${SCORING_DIR}/api_endpoints.txt"
+  local interesting_urls="${SCORING_DIR}/high_priority.txt"
   
-  # Regex para eliminar librerías conocidas (Anti-Librerías)
-  local LIB_REGEX='jquery|bootstrap|react|vue|angular|node_modules|wp-includes|wp-content|cdn|static|assets|libraries|vendor|third-party|framework|polyfill|analytics|gtag|facebook|google|twitter'
+  local secrets_dir="${SECRETS_DIR}"
+  local gf_secrets="${secrets_dir}/gf_patterns_output.txt"
+  local httpx_secrets="${secrets_dir}/httpx_responses_secrets.txt"
+  local trufflehog_out="${secrets_dir}/trufflehog_findings.json"
+  local ripgrep_secrets="${secrets_dir}/ripgrep_patterns.txt"
+  local potential="${secrets_dir}/potential_secrets.txt"
+  local false_pos="${secrets_dir}/false_positives.txt"
+  local final_report="${secrets_dir}/secrets_summary.txt"
   
-  # Regex para archivos jugosos (Juicy Files)
-  local JUICY_REGEX='api|config|admin|auth|v1|v2|user|setting|env|token|dashboard|panel|console|internal|backend|gateway|service|endpoint|graphql|swagger|openapi|key|secret|credential|jwt|bearer'
-
-  if ! command -v SecretFinder &>/dev/null; then
-    log_skip "SecretFinder"
-  elif [[ ! -s "$js_urls" ]]; then
-    log_skip "Sin archivos JS para analizar"
-  else
-    local total_js
-    total_js=$(wc -l < "$js_urls")
-    log_info "Filtrando ${total_js} archivos JS..."
-
-    # Paso 1: Limpieza de ruido (Anti-Librerías)
-    log_info "  ▶ Eliminando librerías conocidas..."
-    grep -vEi "$LIB_REGEX" "$js_urls" 2>/dev/null > "${juicy_js}.tmp" || true
+  > "$potential"
+  > "$false_pos"
+  
+  # ── TÉCNICA 1: GF PATTERNS (Si disponible) ──────────────────
+  if command -v gf &>/dev/null; then
+    log_info "Técnica 1/4: GF Patterns (búsqueda de URLs sospechosas)..."
     
-    # Paso 2: Priorización (Juicy Files)
-    log_info "  ▶ Filtrando archivos críticos de negocio..."
-    grep -Ei "$JUICY_REGEX" "${juicy_js}.tmp" 2>/dev/null > "$juicy_js" || true
-    
-    # Paso 3: Límite de archivos (máximo 40)
-    local before_limit
-    before_limit=$(wc -l < "$juicy_js" 2>/dev/null || echo 0)
-    if [[ $before_limit -gt 40 ]]; then
-      log_info "  ▶ Limitando a 40 archivos más prometedores (de ${before_limit})..."
-      head -40 "$juicy_js" > "${juicy_js}.tmp"
-      mv "${juicy_js}.tmp" "$juicy_js"
-    fi
-    
-    local final_count
-    final_count=$(wc -l < "$juicy_js" 2>/dev/null || echo 0)
-    log_ok "Archivos seleccionados: ${final_count}/${total_js}"
-
-    if [[ $final_count -eq 0 ]]; then
-      log_warn "No hay archivos JS prometedores para analizar"
-    else
-      # Sub-función para ejecución paralela
-      _analyze_js() {
-        local js_url="$1"
-        timeout 25s python3 SecretFinder.py -i "$js_url" -o cli 2>/dev/null || true
-      }
-      export -f _analyze_js
-
-      # Ejecución Paralela Controlada (Capturando el output de parallel directamente)
-      log_info "Analizando ${final_count} archivos con SecretFinder (5 hilos, 25s timeout)..."
+    _scan_with_gf() {
+      local urls_file="$1"
+      local pattern="$2"
+      local out="$3"
       
-      if command -v parallel &>/dev/null; then
-        # Dejamos que parallel gestione la salida limpia hacia el archivo
-        parallel --bar -j 5 _analyze_js :::: "$juicy_js" > "$raw_secrets" 2>/dev/null || true
-      else
-        # Fallback secuencial
-        > "$raw_secrets"
-        while IFS= read -r js_url; do
-          [[ -z "$js_url" ]] && continue
-          timeout 25s python3 SecretFinder.py -i "$js_url" -o cli 2>/dev/null >> "$raw_secrets" || true
-        done < "$juicy_js"
-      fi
-
-      # Filtrar falsos positivos
-      if [[ -s "$raw_secrets" ]]; then
-        grep -viE "$FP_REGEX" "$raw_secrets" | sort -u > "$potential" 2>/dev/null || true
-        grep -iE "$FP_REGEX" "$raw_secrets" | sort -u > "$false_pos" 2>/dev/null || true
-
-        log_ok "Secretos potenciales: $(wc -l < "$potential" 2>/dev/null || echo 0) → ${potential}"
-        log_ok "Falsos positivos filtrados: $(wc -l < "$false_pos" 2>/dev/null || echo 0) → ${false_pos}"
-      else
-        log_warn "Sin resultados de SecretFinder"
-        > "$potential"
-        > "$false_pos"
-      fi
-    fi
+      [[ ! -s "$urls_file" ]] && return
+      
+      # gf busca en URLs directamente
+      while IFS= read -r url; do
+        [[ -z "$url" ]] && continue
+        gf "$pattern" <<< "$url" 2>/dev/null
+      done < "$urls_file" >> "$out" 2>/dev/null || true
+    }
+    
+    # Patterns críticos: API Keys, AWS, Tokens, etc.
+    for pattern in api aws slack firebase github shodan twilio; do
+      [[ -s "$api_urls" ]] && _scan_with_gf "$api_urls" "$pattern" "$gf_secrets"
+    done
+    
+    # Dedup + limpiar
+    [[ -s "$gf_secrets" ]] && sort -u "$gf_secrets" -o "$gf_secrets"
+    local gf_count=$(wc -l < "$gf_secrets" 2>/dev/null || echo 0)
+    [[ $gf_count -gt 0 ]] && log_ok "  GF: ${gf_count} hallazgos potenciales"
+  else
+    log_skip "gf (patrones de grep-filter)"
   fi
-
-  # Limpieza de archivos temporales (siempre se ejecuta)
-  rm -f "${juicy_js}.tmp"
-
-  # TruffleHog (sin cambios, ya está optimizado)
-  if command -v trufflehog &>/dev/null; then
-    log_info "TruffleHog sobre outputs del proyecto..."
-    trufflehog filesystem "${PROJECT_DIR}/content" \
-      --json --no-update 2>/dev/null > "$trufflehog_out" || true
-
-    # Filtrar falsos positivos del output de TruffleHog
-    if [[ -s "$trufflehog_out" ]]; then
-      local found
-      found=$(grep -c '"DetectorName"' "$trufflehog_out" 2>/dev/null || echo 0)
-      local real_secrets
-      real_secrets=$(grep -viE "$FP_REGEX" "$trufflehog_out" | grep -c '"DetectorName"' 2>/dev/null || echo 0)
-      log_ok "TruffleHog: ${found} hits, ~${real_secrets} tras filtro FP → ${trufflehog_out}"
-    else
-      log_ok "TruffleHog: sin resultados"
+  
+  # ── TÉCNICA 2: ANÁLISIS DE RESPONSES HTTP (HEADERS + BODY) ────
+  log_info "Técnica 2/4: Extrayendo secretos de responses HTTP..."
+  
+  _extract_http_secrets() {
+    local urls_file="$1"
+    local out="$2"
+    
+    [[ ! -s "$urls_file" ]] && return
+    
+    local total=$(wc -l < "$urls_file")
+    [[ $total -eq 0 ]] && return
+    
+    # Limitar a 50 URLs para no abrumar la red
+    local url_count=50
+    if [[ $total -gt $url_count ]]; then
+      head -"$url_count" "$urls_file" > "${urls_file}.sample"
+      urls_file="${urls_file}.sample"
     fi
+    
+    # Descargar responses con httpx + jq
+    # Capturar: headers (Authorization, X-API-Key, etc.) + body (strings sospechosas)
+    httpx \
+      -l "$urls_file" \
+      -status-code -header "Authorization" -header "X-API-Key" \
+      -timeout 8 -threads 15 -silent \
+      -json 2>/dev/null | \
+      jq -r '
+        [
+          (.headers.Authorization // empty),
+          (.headers["X-API-Key"] // empty),
+          (.headers["X-Access-Token"] // empty),
+          (.headers["X-Auth-Token"] // empty),
+          (.headers["Cf-Ray"] // empty),
+          (.body // empty | strings)
+        ] | 
+        .[] | 
+        select(length > 0)
+      ' >> "$out" 2>/dev/null || true
+    
+    rm -f "${urls_file}.sample"
+  }
+  
+  _extract_http_secrets "$interesting_urls" "$httpx_secrets"
+  _extract_http_secrets "$api_urls" "$httpx_secrets"
+  
+  [[ -s "$httpx_secrets" ]] && sort -u "$httpx_secrets" -o "$httpx_secrets"
+  local http_count=$(wc -l < "$httpx_secrets" 2>/dev/null || echo 0)
+  [[ $http_count -gt 0 ]] && log_ok "  HTTP: ${http_count} valores extraídos"
+  
+  # ── TÉCNICA 3: RIPGREP (Búsqueda rápida en archivos JS descargados) ──
+  log_info "Técnica 3/4: Ripgrep en archivos JS (patrones de secretos)..."
+  
+  _download_and_scan_js() {
+    local urls_file="$1"
+    local out="$2"
+    
+    [[ ! -s "$urls_file" ]] && return
+    
+    local js_cache="${SECRETS_DIR}/.js_cache"
+    mkdir -p "$js_cache"
+    
+    local count=0
+    while IFS= read -r js_url; do
+      [[ -z "$js_url" ]] && continue
+      [[ $count -ge 30 ]] && break  # Máximo 30 archivos JS
+      
+      local js_file
+      js_file=$(echo "$js_url" | md5sum | awk '{print $1}')
+      js_file="${js_cache}/${js_file}.js"
+      
+      # Descargar con timeout
+      timeout 10s curl -s "$js_url" > "$js_file" 2>/dev/null || continue
+      
+      [[ ! -s "$js_file" ]] && continue
+      
+      # Ripgrep patterns: API keys, tokens, private keys, etc.
+      rg -i '(api[_-]?key|secret[_-]?key|access[_-]?token|refresh[_-]?token|bearer\s+[a-zA-Z0-9\.\-_]+|password\s*=|private[_-]?key|aws[_-]?secret|mongodb[_-]?uri|firebase[_-]?key|slack[_-]?token|github[_-]?token|stripe[_-]?(secret|publishable)|shopify[_-]?token)' \
+        "$js_file" >> "$out" 2>/dev/null || true
+      
+      ((count++))
+    done < "$urls_file"
+    
+    rm -rf "$js_cache"
+  }
+  
+  _download_and_scan_js "$js_urls" "$ripgrep_secrets"
+  
+  [[ -s "$ripgrep_secrets" ]] && sort -u "$ripgrep_secrets" -o "$ripgrep_secrets"
+  local rg_count=$(wc -l < "$ripgrep_secrets" 2>/dev/null || echo 0)
+  [[ $rg_count -gt 0 ]] && log_ok "  Ripgrep: ${rg_count} coincidencias en JS"
+  
+  # ── TÉCNICA 4: TRUFFLEHOG (Sobre URLs descargadas + archivos JS) ────
+  if command -v trufflehog &>/dev/null; then
+    log_info "Técnica 4/4: TruffleHog en archivos descargados..."
+    
+    # Crear directorio temporal con archivos de entrada
+    local th_scan_dir="${SECRETS_DIR}/.trufflehog_scan"
+    mkdir -p "$th_scan_dir"
+    
+    # Copiar outputs del recon como "archivos" para TruffleHog
+    [[ -s "$api_urls" ]] && cp "$api_urls" "${th_scan_dir}/api_urls.txt"
+    [[ -s "$gf_secrets" ]] && cp "$gf_secrets" "${th_scan_dir}/gf_output.txt"
+    [[ -s "$httpx_secrets" ]] && cp "$httpx_secrets" "${th_scan_dir}/http_responses.txt"
+    [[ -s "$ripgrep_secrets" ]] && cp "$ripgrep_secrets" "${th_scan_dir}/js_patterns.txt"
+    
+    # Ejecutar TruffleHog
+    timeout 5m trufflehog filesystem "$th_scan_dir" \
+      --json --no-update 2>/dev/null > "$trufflehog_out" || true
+    
+    rm -rf "$th_scan_dir"
+    
+    local th_count=$(grep -c '"DetectorName"' "$trufflehog_out" 2>/dev/null || echo 0)
+    [[ $th_count -gt 0 ]] && log_ok "  TruffleHog: ${th_count} secretos detectados"
   else
     log_skip "trufflehog"
+    > "$trufflehog_out"
   fi
+  
+  # ── CONSOLIDACIÓN: Merge + Filtrado Avanzado ─────────────────────
+  log_info "Consolidando resultados (filtrado de falsos positivos)..."
+  
+  > "$potential"
+  
+  # Merge de todas las técnicas
+  cat "$gf_secrets" "$httpx_secrets" "$ripgrep_secrets" 2>/dev/null | \
+    sort -u >> "$potential" || true
+  
+  # Agregar hallazgos de TruffleHog (si existen)
+  if [[ -s "$trufflehog_out" ]]; then
+    jq -r '.Raw // empty' "$trufflehog_out" 2>/dev/null >> "$potential" || true
+  fi
+  
+  # ── FILTRO AVANZADO DE FALSOS POSITIVOS ───────────────────────────
+  local fp_file="${SECRETS_DIR}/.fp_patterns"
+  cat > "$fp_file" <<'FPEOF'
+# Falsos positivos comunes a eliminar
+(?i)^(example|test|placeholder|changeme|yourapikey|your_key|INSERT_KEY|YOUR_TOKEN|REPLACE_ME)
+(?i)^(xxxx|1234567890|000000|aaaaaa|dummy|sample|foobar|lorem|ipsum|donottrust)
+(?i)^(user|password|admin|root|test123|password123|12345|qwerty)
+(?i)^(https?://(example|test|localhost|127\.0\.0\.1|192\.168|10\.0|172\.16))
+(?i)(librer|framework|analytics|cdn|static|jquery|react|bootstrap|angular|vue)
+^$
+^\s+$
+FPEOF
+  
+  # Filtrar falsos positivos con ripgrep (si disponible)
+  if command -v rg &>/dev/null; then
+    rg -v -f "$fp_file" "$potential" > "${potential}.clean" 2>/dev/null || cp "$potential" "${potential}.clean"
+  else
+    grep -vEif <(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' "$fp_file" | grep -v '^#' | grep -v '^$') "$potential" > "${potential}.clean" 2>/dev/null || cp "$potential" "${potential}.clean"
+  fi
+  
+  mv "${potential}.clean" "$potential"
+  
+  # Separar FP confirmados
+  if [[ -s "$potential" ]]; then
+    if command -v rg &>/dev/null; then
+      rg -f "$fp_file" "$potential" > "$false_pos" 2>/dev/null || true
+    else
+      grep -Eif <(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' "$fp_file" | grep -v '^#' | grep -v '^$') "$potential" > "$false_pos" 2>/dev/null || true
+    fi
+  fi
+  
+  rm -f "$fp_file"
+  
+  # ── RANKING Y REPORTE FINAL ──────────────────────────────────────
+  local total_raw total_fp total_clean
+  total_raw=$(wc -l < "$potential" 2>/dev/null || echo 0)
+  total_fp=$(wc -l < "$false_pos" 2>/dev/null || echo 0)
+  total_clean=$(( total_raw - total_fp ))
+  
+  # Generar summary visual
+  cat > "$final_report" <<EOF
+╔════════════════════════════════════════════════════════════════╗
+║           SECRET DISCOVERY — RESUMEN DE HALLAZGOS              ║
+╚════════════════════════════════════════════════════════════════╝
+
+ TÉCNICAS UTILIZADAS:
+   ✓ GF Patterns          (URLs con patterns sospechosos)
+   ✓ HTTP Responses       (Headers + Body de respuestas)
+   ✓ Ripgrep en JS        (Patrones en archivos JavaScript)
+   ✓ TruffleHog           (Detectores de entropía)
+
+ ESTADÍSTICAS:
+   Total valores extraídos:    ${total_raw}
+   Falsos positivos filtrados: ${total_fp}
+   Secretos potenciales:       ${total_clean}
+
+ ARCHIVOS GENERADOS:
+   → ${potential}              (Secretos potenciales)
+   → ${false_pos}              (Falsos positivos)
+   → ${gf_secrets}             (GF Patterns)
+   → ${httpx_secrets}          (HTTP Headers/Body)
+   → ${ripgrep_secrets}        (JS Patterns)
+   → ${trufflehog_out}         (TruffleHog JSON)
+
+  PRÓXIMOS PASOS:
+   1. Revisar: cat ${potential} | head -20
+   2. Validar credenciales encontradas
+   3. Reportar secretos expuestos responsablemente
+EOF
+
+  log_ok "Secret Discovery completado"
+  log_ok "═══════════════════════════════════════════════════════"
+  cat "$final_report"
+  log_ok "═══════════════════════════════════════════════════════"
 }
 
 # ──────────────────────────────────────────────
@@ -1476,7 +1637,7 @@ main() {
 
   run_subdomain_enum    # M1 — subfinder+assetfinder+amass (paralelo)
   run_dnsx              # M2 — validar DNS
-  run_wafw00f           # M3 — detectar WAF → preguntar si cambiar modo
+  run_wafw00f           # M3 — detectar WAF → pregunta si cambiar modo
   run_httpx             # M4 — hosts activos + clasificación
   run_wayback           # M5 — gau+waybackurls por dominio raíz (paralelo)
   run_katana            # M6 — crawl priorizado y limitado
