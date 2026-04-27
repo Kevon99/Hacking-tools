@@ -15,6 +15,7 @@
 #    [M10] Filtro out_scope          → aplica a todos los outputs
 #    [M11] Nuclei                    → sobre high_priority.txt (dedup)
 #    [M12] Reporte JSON              → estadísticas + muestras + rutas
+#    [M13] IP Discovery & Port Scanning  → extrae IPs + escanea puertos
 #
 #  Uso:
 #    bash recon.sh <proyecto> [targets.txt] [out_scope.txt] [--normal|--stealth|--aggressive]
@@ -319,6 +320,7 @@ create_structure() {
   SECRETS_DIR="${MAP_DIR}/secrets"
   FUZZING_DIR="${MAP_DIR}/fuzzing"
   NUCLEI_DIR="${MAP_DIR}/nuclei"
+  IP_DISCOVER_DIR="${MAP_DIR}/ip_discover"
 
   mkdir -p \
     "${PROJECT_DIR}/nmap" \
@@ -332,37 +334,10 @@ create_structure() {
     "${SCORING_DIR}" \
     "${SECRETS_DIR}" \
     "${FUZZING_DIR}" \
-    "${NUCLEI_DIR}"
+    "${NUCLEI_DIR}" \
+    "${IP_DISCOVER_DIR}"
 
   log_ok "Carpetas creadas en ./${PROJECT_NAME}/"
-}
-
-# ──────────────────────────────────────────────
-# TARGETS
-# ──────────────────────────────────────────────
-collect_targets() {
-  TARGETS_FILE="${CONTENT_DIR}/targets.txt"
-  log_section "Configurando targets"
-
-  if [[ -n "${INPUT_TARGETS_FILE:-}" ]]; then
-    [[ ! -f "$INPUT_TARGETS_FILE" ]] && log_error "Archivo no encontrado: $INPUT_TARGETS_FILE"
-    cp "$INPUT_TARGETS_FILE" "$TARGETS_FILE"
-    log_ok "Targets cargados desde: $INPUT_TARGETS_FILE"
-  else
-    echo -e "${YELLOW}Ingresa dominios objetivo (uno por línea). ENTER vacío para terminar:${RESET}"
-    echo ""
-    > "$TARGETS_FILE"
-    while IFS= read -rp "  dominio: " line; do
-      [[ -z "$line" ]] && break
-      echo "$line" >> "$TARGETS_FILE"
-    done
-  fi
-
-  sed -i '/^[[:space:]]*$/d' "$TARGETS_FILE"
-  local count
-  count=$(wc -l < "$TARGETS_FILE")
-  log_ok "$count dominio(s) → ${TARGETS_FILE}"
-  while IFS= read -r d; do echo "    • $d"; done < "$TARGETS_FILE"
 }
 
 # ──────────────────────────────────────────────
@@ -1442,6 +1417,8 @@ run_nuclei() {
     -o "$output" -json-export "$output_json" \
     2>/dev/null || true
 
+
+
   local findings
   findings=$(wc -l < "$output" 2>/dev/null || echo 0)
 
@@ -1597,6 +1574,361 @@ EOF
 }
 
 # ──────────────────────────────────────────────
+# M13 — IP DISCOVERY & PORT SCANNING
+#
+# Flujo:
+#   1. Extrae IPs del JSON de httpx
+#   2. Detecta WAFs por webserver/cdn_name
+#   3. Filtra IPs directas (sin CDN comercial)
+#   4. Realiza port scan con naabu (top 1000)
+#   5. Service detection con nmap en puertos encontrados
+#   6. Mapea: IP → Host → Puerto → Servicio
+#
+# Outputs:
+#   ip_discover/all_ips.txt              — todas las IPs únicas
+#   ip_discover/ips_behind_cdn.txt       — IPs detectadas con CDN
+#   ip_discover/ips_direct.txt           — IPs directas (sin CDN)
+#   ip_discover/ip_waf_mapping.tsv       — IP → WAF → Host
+#   ip_discover/open_ports.txt           — IP:Puerto de puertos abiertos
+#   ip_discover/port_summary.tsv         — IP:Puerto → Servicio
+#   ip_discover/nmap_full.xml            — XML completo de nmap
+#   ip_discover/targets_for_nmap.txt     — IPs para nmap
+# ──────────────────────────────────────────────
+
+run_ip_discovery() {
+  log_section "M13 — IP Discovery & Port Scanning"
+  
+  local httpx_json="${HTTPX_DIR}/httpx_output.json"
+  local ip_dir="${IP_DISCOVER_DIR}"
+  
+  local all_ips="${ip_dir}/all_ips.txt"
+  local ips_with_cdn="${ip_dir}/ips_behind_cdn.txt"
+  local ips_direct="${ip_dir}/ips_direct.txt"
+  local ip_waf_map="${ip_dir}/ip_waf_mapping.tsv"
+  local open_ports="${ip_dir}/open_ports.txt"
+  local port_summary="${ip_dir}/port_summary.tsv"
+  local nmap_xml="${ip_dir}/nmap_full.xml"
+  local nmap_targets="${ip_dir}/targets_for_nmap.txt"
+  local cdn_list="${ip_dir}/.cdn_fingerprints"
+  
+  # ── Paso 1: Validación de entrada ────────────────────────
+  if [[ ! -s "$httpx_json" ]]; then
+    log_warn "httpx JSON vacío. Saltando IP Discovery."
+    return
+  fi
+  
+  log_info "Analizando JSON de httpx (${HTTPX_DIR})..."
+  
+  # ── Paso 2: Construir lista de CDN comerciales ──────────
+  cat > "$cdn_list" <<'CDNEOF'
+cloudflare
+akamai
+fastly
+cloudfront
+azurecdn
+cdn77
+varnish
+sucuri
+imperva
+ddos-guard
+incapsula
+jschl
+__cfduid
+cf-ray
+CDNEOF
+  
+  # ── Paso 3: Extracción y clasificación de IPs ─────────────
+  log_info "Extrayendo IPs y detectando WAFs..."
+  
+  python3 - <<'PYEOF'
+import json
+import re
+from pathlib import Path
+from collections import defaultdict
+
+httpx_json = "${httpx_json}"
+all_ips_file = "${all_ips}"
+ips_cdn_file = "${ips_with_cdn}"
+ips_direct_file = "${ips_direct}"
+ip_waf_file = "${ip_waf_map}"
+cdn_list_file = "${cdn_list}"
+
+# Cargar fingerprints de CDN
+cdn_patterns = set()
+if Path(cdn_list_file).exists():
+    cdn_patterns = set(line.strip().lower() 
+                       for line in Path(cdn_list_file).read_text().splitlines() 
+                       if line.strip())
+
+# Cargar JSON de httpx
+try:
+    with open(httpx_json, 'r') as f:
+        results = [json.loads(line) for line in f if line.strip()]
+except Exception as e:
+    print(f"Error leyendo JSON: {e}")
+    results = []
+
+# Estructuras de datos
+ips_with_hosts = defaultdict(set)      # IP → set(hosts)
+ip_to_waf = {}                          # IP → WAF detected
+ip_to_cdn = {}                          # IP → CDN detected
+ips_cdn = set()
+ips_direct = set()
+ip_waf_lines = []
+
+# Procesar resultados
+for entry in results:
+    if not isinstance(entry, dict):
+        continue
+    
+    # Extraer IP, host, webserver, cdn_name
+    ip = entry.get('host_ip', '').strip()
+    host = entry.get('host', '') or entry.get('url', '').split('/')[2]
+    url = entry.get('url', '')
+    webserver = (entry.get('webserver') or '').lower()
+    cdn_name = (entry.get('cdn_name') or '').lower()
+    status = entry.get('status_code', 0)
+    title = entry.get('title', '')
+    
+    if not ip or ip == 'N/A':
+        continue
+    
+    # Registrar host
+    if host:
+        ips_with_hosts[ip].add(host)
+    
+    # Detectar CDN por webserver o cdn_name
+    is_cdn = False
+    waf_detected = None
+    
+    # Detección de CDN
+    for pattern in cdn_patterns:
+        if pattern in webserver or pattern in cdn_name:
+            is_cdn = True
+            waf_detected = cdn_name or webserver or 'CDN'
+            break
+    
+    # Detección de WAF por webserver (si no es CDN)
+    if not is_cdn:
+        waf_keywords = ['imperva', 'sucuri', 'incapsula', 'barracuda', 
+                        'fortinet', 'paloalto', 'f5', 'mod_security', 
+                        'aws-waf', 'azure-waf']
+        for keyword in waf_keywords:
+            if keyword in webserver:
+                waf_detected = keyword.upper()
+                break
+    
+    # Clasificar IP
+    if is_cdn:
+        ips_cdn.add(ip)
+        ip_to_cdn[ip] = waf_detected
+    else:
+        ips_direct.add(ip)
+        ip_to_waf[ip] = waf_detected
+    
+    # Generar línea TSV
+    waf_str = waf_detected or "DIRECT"
+    waf_str = f"[{waf_str}]"
+    ip_waf_lines.append(f"{ip}\t{waf_str}\t{', '.join(ips_with_hosts[ip])}")
+
+# Escribir outputs
+Path(all_ips_file).write_text('\n'.join(sorted(set(list(ips_cdn) + list(ips_direct)))) + '\n')
+Path(ips_cdn_file).write_text('\n'.join(sorted(ips_cdn)) + '\n')
+Path(ips_direct_file).write_text('\n'.join(sorted(ips_direct)) + '\n')
+
+# Escribir mapeo IP → WAF → Hosts
+with open(ip_waf_file, 'w') as f:
+    f.write("IP\tWAF/CDN\tHosts\n")
+    for line in sorted(set(ip_waf_lines)):
+        f.write(line + '\n')
+
+print(f"Total IPs: {len(ips_cdn) + len(ips_direct)}")
+print(f"  - Con CDN: {len(ips_cdn)}")
+print(f"  - Directas: {len(ips_direct)}")
+
+PYEOF
+
+  # Contar resultados
+  local total_ips=$(wc -l < "$all_ips" 2>/dev/null || echo 0)
+  local cdn_count=$(wc -l < "$ips_with_cdn" 2>/dev/null || echo 0)
+  local direct_count=$(wc -l < "$ips_direct" 2>/dev/null || echo 0)
+  
+  log_ok "IPs totales: ${total_ips} (CDN: ${cdn_count}, Directas: ${direct_count})"
+  
+  # ── Paso 4: Port scanning con naabu (solo IPs directas) ──
+  if [[ $direct_count -eq 0 ]]; then
+    log_warn "Sin IPs directas. Saltando port scan."
+    return
+  fi
+  
+  log_info "Escaneando top 1000 puertos en ${direct_count} IPs directas..."
+  
+  if ! command -v naabu &>/dev/null; then
+    log_skip "naabu"
+    > "$open_ports"
+  else
+    # Naabu: rápido y verificado
+    timeout 30m naabu \
+      -list "$ips_direct" \
+      -top-ports 1000 \
+      -rate 500 \
+      -verify \
+      -silent \
+      -o "$open_ports" \
+      2>/dev/null || true
+  fi
+  
+  local ports_found=$(wc -l < "$open_ports" 2>/dev/null || echo 0)
+  log_ok "Puertos abiertos encontrados: ${ports_found}"
+  
+  # ── Paso 5: Service detection con nmap (si hay puertos) ──
+  if [[ $ports_found -eq 0 ]]; then
+    log_warn "Sin puertos abiertos. Saltando nmap."
+    > "$port_summary"
+    return
+  fi
+  
+  log_info "Detectando servicios con nmap (máx 500 puertos)..."
+  
+  if ! command -v nmap &>/dev/null; then
+    log_skip "nmap"
+    > "$port_summary"
+  else
+    # Extraer puertos únicos (máximo 500 para no sobrecargar)
+    local ports_str
+    ports_str=$(cut -d':' -f2 "$open_ports" | sort -u | head -500 | tr '\n' ',' | sed 's/,$//')
+    
+    # Limitar IPs para nmap (máx 50 para rapidez)
+    head -50 "$ips_direct" > "$nmap_targets"
+    local nmap_ip_count=$(wc -l < "$nmap_targets")
+    
+    # Ejecutar nmap con timeout
+    timeout 45m nmap \
+      -sV -sC -T4 \
+      -iL "$nmap_targets" \
+      -p "$ports_str" \
+      --open \
+      -oX "$nmap_xml" \
+      2>/dev/null || true
+    
+    # Parsear nmap XML y generar TSV
+    _parse_nmap_xml "$nmap_xml" "$port_summary"
+    
+    log_ok "Nmap completado en ${nmap_ip_count} IPs → ${nmap_xml}"
+  fi
+  
+  # ── Paso 6: Reporte final ──────────────────────────────
+  _generate_ip_discover_report
+}
+
+# ──────────────────────────────────────────────
+# Helper: Parsear nmap XML y generar TSV
+# ──────────────────────────────────────────────
+_parse_nmap_xml() {
+  local xml_file="$1"
+  local output_tsv="$2"
+  
+  [[ ! -f "$xml_file" ]] && { > "$output_tsv"; return; }
+  
+  python3 - <<'NMAP_PARSE'
+import xml.etree.ElementTree as ET
+import sys
+from pathlib import Path
+
+xml_file = "${xml_file}"
+output_file = "${output_tsv}"
+
+try:
+    tree = ET.parse(xml_file)
+    root = tree.getroot()
+except:
+    Path(output_file).write_text("")
+    sys.exit(0)
+
+results = []
+results.append("IP\tPort\tState\tService\tVersion")
+
+for host in root.findall('.//host'):
+    address = host.find('.//address[@addrtype="ipv4"]')
+    if address is None:
+        continue
+    
+    ip = address.get('addr', 'N/A')
+    
+    for port in host.findall('.//port'):
+        port_id = port.get('portid', 'N/A')
+        state = port.find('state')
+        state_str = state.get('state', 'unknown') if state is not None else 'unknown'
+        
+        service = port.find('service')
+        if service is not None:
+            service_name = service.get('name', 'unknown')
+            version = service.get('version', '')
+            version_str = f"{service_name} {version}".strip()
+        else:
+            version_str = "unknown"
+        
+        if state_str == 'open':
+            results.append(f"{ip}\t{port_id}\t{state_str}\t{version_str}")
+
+with open(output_file, 'w') as f:
+    f.write('\n'.join(results) + '\n')
+
+NMAP_PARSE
+}
+
+# ──────────────────────────────────────────────
+# Helper: Generar reporte de IP Discovery
+# ──────────────────────────────────────────────
+_generate_ip_discover_report() {
+  local ip_dir="${IP_DISCOVER_DIR}"
+  local report="${ip_dir}/ip_discovery_report.txt"
+  
+  local all_ips=$(wc -l < "${ip_dir}/all_ips.txt" 2>/dev/null || echo 0)
+  local cdn_ips=$(wc -l < "${ip_dir}/ips_behind_cdn.txt" 2>/dev/null || echo 0)
+  local direct_ips=$(wc -l < "${ip_dir}/ips_direct.txt" 2>/dev/null || echo 0)
+  local open_ports=$(wc -l < "${ip_dir}/open_ports.txt" 2>/dev/null || echo 0)
+  local services=$(tail -n +2 "${ip_dir}/port_summary.tsv" 2>/dev/null | wc -l || echo 0)
+  
+  cat > "$report" <<EOF
+╔═══════════════════════════════════════════════════════════════╗
+║            IP DISCOVERY & PORT SCANNING REPORT                ║
+╚═══════════════════════════════════════════════════════════════╝
+
+ RESUMEN GENERAL:
+   Total IPs encontradas:         ${all_ips}
+   IPs detrás de CDN:             ${cdn_ips}
+   IPs directas (scanneables):    ${direct_ips}
+   Puertos abiertos descubiertos: ${open_ports}
+   Servicios identificados:       ${services}
+
+ ARCHIVOS GENERADOS:
+   → all_ips.txt              (Todas las IPs únicas)
+   → ips_behind_cdn.txt       (IPs con CDN detectado)
+   → ips_direct.txt           (IPs directas, objetivo principal)
+   → ip_waf_mapping.tsv       (Mapeo IP → WAF/CDN → Hosts)
+   → open_ports.txt           (Formato: IP:Puerto)
+   → port_summary.tsv         (IP → Puerto → Servicio)
+   → nmap_full.xml            (XML completo de nmap)
+
+ PRÓXIMOS PASOS:
+   1. Revisar IPs directas: cat ${ip_dir}/ips_direct.txt
+   2. Mapeos WAF: cat ${ip_dir}/ip_waf_mapping.tsv
+   3. Servicios: cat ${ip_dir}/port_summary.tsv
+   4. Para análisis profundo: nmap -sV -p- <IP> --script vuln
+
+  NOTAS:
+   • CDN detectado: No es atacable directamente
+   • IPs directas: Potencial valor alto (sin protección)
+   • Verificar permisos de scope antes de escanear
+
+EOF
+
+  log_ok "Reporte → ${report}"
+  cat "$report"
+}
+
+# ──────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────
 main() {
@@ -1643,14 +1975,12 @@ main() {
   run_katana            # M6 — crawl priorizado y limitado
 
   run_scoring           # M7 — attack surface scoring (Python)
-
-  run_secrets           # M8 — SecretFinder+TruffleHog (filtro FP)
-  run_fuzzing           # M9 — ffuf/feroxbuster solo high-priority
-
-  filter_out_scope      # M10 — filtrar OOS de todos los outputs
-
-  run_nuclei            # M11 — nuclei sobre high_priority (dedup, limitado en stealth)
-  generate_report       # M12 — reporte JSON ligero
+  run_secrets           # M8 — Secret Discovery
+  run_fuzzing           # M9 — Content Discovery
+  filter_out_scope      # M10 — filtrar OOS
+  run_nuclei            # M11 — nuclei
+  run_ip_discovery      # M13 — IP Discovery & Port Scanning (NUEVO)
+  generate_report       # M12 — reporte JSON
   # ────────────────────────────────────────────
 
   log_section "✅  Recon completado"
