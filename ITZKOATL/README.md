@@ -1,7 +1,7 @@
 # 🐍 ITZKOATL — Obsidian Recon Engine
 
 
-ITZKOATL (Nahuatl: Obsidian Serpent) is a high-performance, automated reconnaissance pipeline designed for Bug Bounty hunters and Security Researchers. Unlike generic tools, ITZKOATL focuses on Smart Prioritization, using Python-based scoring to filter noise and target high-impact attack surfaces.
+ITZKOATL (Nahuatl: Obsidian Serpent) 
 
 
 Key Features
@@ -20,10 +20,10 @@ Key Features
 ## Installation & Usage
 
 # Clone and enter the directory
-git clone https://github.com/youruser/ITZKOATL.git && cd ITZKOATL
+git clone https://github.com/Kevon99/Hacking-tools/tree/master/ITZKOATL 
 
 # Run the engine
-bash recon.sh <project_name> [targets.txt] [out_scope.txt] --normal
+bash itzkoatl.sh <project_name> [targets.txt] [out_scope.txt] --normal
 
 
 ## SPANISH

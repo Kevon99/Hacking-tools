@@ -1929,6 +1929,42 @@ EOF
 }
 
 # ──────────────────────────────────────────────
+# COLLECT TARGETS — Handle targets file input
+# ──────────────────────────────────────────────
+collect_targets() {
+    log_section "Configurando objetivos"
+    
+    if [[ -n "${INPUT_TARGETS_FILE:-}" && -f "$INPUT_TARGETS_FILE" ]]; then
+        TARGETS_FILE="$INPUT_TARGETS_FILE"
+        log_ok "Targets file: ${TARGETS_FILE}"
+    elif [[ -n "${INPUT_TARGETS_FILE:-}" && ! -f "$INPUT_TARGETS_FILE" ]]; then
+        log_error "Archivo de targets no encontrado: ${INPUT_TARGETS_FILE}"
+    else
+        # Modo interactivo: pedir dominios al usuario
+        log_info "No se proporcionó archivo de targets. Ingresa dominios (uno por línea, Ctrl+D para terminar):"
+        TARGETS_FILE="${PROJECT_DIR}/targets_input.txt"
+        > "$TARGETS_FILE"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && echo "$line" >> "$TARGETS_FILE"
+        done
+    fi
+    
+    # Validar que haya contenido
+    if [[ ! -s "$TARGETS_FILE" ]]; then
+        log_error "Sin objetivos válidos. El archivo de targets está vacío."
+    fi
+    
+    # Normalizar: quitar protocolos, paths, espacios y duplicados
+    sed -i 's|https\?://||g; s|/.*$||g; s|^[[:space:]]*||; s|[[:space:]]*$||' "$TARGETS_FILE"
+    sort -u "$TARGETS_FILE" -o "$TARGETS_FILE"
+    sed -i '/^[[:space:]]*$/d' "$TARGETS_FILE"
+    
+    local count
+    count=$(wc -l < "$TARGETS_FILE")
+    log_ok "Objetivos cargados: ${count} dominios raíz → ${TARGETS_FILE}"
+}
+
+# ──────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────
 main() {
