@@ -66,15 +66,14 @@ _cleanup_and_exit() {
   _flush_partial_results 2>/dev/null || true
 
   # Mostrar lo que se salvó
-  if [[ -n "${SUBFINDER_DIR:-}" && -s "${SUBFINDER_DIR}/subfinder_output.txt" ]]; then
-    local saved
-    saved=$(wc -l < "${SUBFINDER_DIR}/subfinder_output.txt")
-    echo -e "${GREEN}[✔]${RESET} Subdominios guardados hasta ahora: ${saved} → ${SUBFINDER_DIR}/subfinder_output.txt"
+  if [[ -n "${SUBFINDER_DIR:-}" && -s "${SUBFINDER_DIR:-}/subfinder_output.txt" ]]; then
+    local saved; saved=$(wc -l < "${SUBFINDER_DIR:-}/subfinder_output.txt")
+    echo -e "${GREEN}[✔]${RESET} Subdominios guardados hasta ahora: ${saved} → ${SUBFINDER_DIR:-}/subfinder_output.txt"
   fi
-  if [[ -n "${HTTPX_DIR:-}" && -s "${HTTPX_DIR}/httpx_output.txt" ]]; then
-    local saved
-    saved=$(wc -l < "${HTTPX_DIR}/httpx_output.txt")
-    echo -e "${GREEN}[✔]${RESET} Hosts activos guardados: ${saved} → ${HTTPX_DIR}/httpx_output.txt"
+  # Repetir para HTTPX_DIR
+  if [[ -n "${HTTPX_DIR:-}" && -s "${HTTPX_DIR:-}/httpx_output.txt" ]]; then
+    local saved; saved=$(wc -l < "${HTTPX_DIR:-}/httpx_output.txt")
+    echo -e "${GREEN}[✔]${RESET} Hosts activos guardados: ${saved} → ${HTTPX_DIR:-}/httpx_output.txt"
   fi
 
   echo -e "${CYAN}[*]${RESET} Puedes reanudar el pipeline manualmente desde donde quedó."
@@ -239,8 +238,8 @@ set_mode_config() {
 check_deps() {
   log_section "Verificando dependencias"
   local critical=("subfinder" "dnsx" "httpx" "katana" "nuclei" "jq")
-  local optional=("assetfinder" "amass" "wafw00f" "waybackurls" "gau"
-                  "SecretFinder" "trufflehog" "ffuf" "feroxbuster" "parallel")
+local optional=("assetfinder" "amass" "wafw00f" "waybackurls" "gau"
+                "SecretFinder" "trufflehog" "ffuf" "feroxbuster" "parallel" "rg" "gf")
   local missing_critical=()
 
   echo -e "${BOLD}  Críticas:${RESET}"
@@ -473,15 +472,12 @@ run_wafw00f() {
       log_warn "WAF detectado en los dominios principales."
 
       if [[ "${RECON_MODE}" != "stealth" ]]; then
-        echo ""
-        log_warn "Modo actual: ${RECON_MODE}. El WAF puede bloquearte."
-        read -rp "  ¿Cambiar a modo STEALTH? [s/N]: " switch
-        if [[ "$switch" =~ ^[sS]$ ]]; then
-          RECON_MODE="stealth"
-          set_mode_config
-          log_ok "Modo cambiado a STEALTH"
+        if [[ -t 0 ]]; then
+          read -rp "  ¿Cambiar a modo STEALTH? [s/N]: " switch
+          [[ "$switch" =~ ^[sS]$ ]] && { RECON_MODE="stealth"; set_mode_config; log_ok "Modo cambiado a STEALTH"; }
         else
-          log_warn "Continuando en modo ${RECON_MODE}. Riesgo de bloqueo."
+          log_warn "Entorno no interactivo. Forzando STEALTH por detección de WAF."
+          RECON_MODE="stealth"; set_mode_config
         fi
       fi
   else
@@ -609,11 +605,12 @@ run_wayback() {
     
     # Máximo 5 minutos por dominio para traer URLs históricas
     if command -v gau &>/dev/null; then
-      timeout 5m echo "$domain" | gau --subs --threads 10 2>/dev/null >> "$out" || true
+      echo "$domain" | timeout 5m gau --subs --threads 10 2>/dev/null >> "$out" || true
+
     fi
     
     if command -v waybackurls &>/dev/null; then
-      timeout 5m echo "$domain" | waybackurls 2>/dev/null >> "$out" || true
+      echo "$domain" | timeout 5m waybackurls 2>/dev/null >> "$out" || true
     fi
   }
   export -f _fetch_wayback
@@ -1167,7 +1164,9 @@ run_secrets() {
   
   # Agregar hallazgos de TruffleHog (si existen)
   if [[ -s "$trufflehog_out" ]]; then
-    jq -r '.Raw // empty' "$trufflehog_out" 2>/dev/null >> "$potential" || true
+    while IFS= read -r line; do
+      echo "$line" | jq -r '.Raw // empty' 2>/dev/null
+    done < "$trufflehog_out" >> "$potential"
   fi
   
   # ── FILTRO AVANZADO DE FALSOS POSITIVOS ───────────────────────────
@@ -1640,7 +1639,7 @@ CDNEOF
   # ── Paso 3: Extracción y clasificación de IPs ─────────────
   log_info "Extrayendo IPs y detectando WAFs..."
   
-  python3 - <<'PYEOF'
+  python3 - <<PYEOF
 import json
 import re
 from pathlib import Path
@@ -1830,7 +1829,7 @@ _parse_nmap_xml() {
   
   [[ ! -f "$xml_file" ]] && { > "$output_tsv"; return; }
   
-  python3 - <<'NMAP_PARSE'
+  python3 - <<NMAP_PARSE
 import xml.etree.ElementTree as ET
 import sys
 from pathlib import Path
