@@ -149,27 +149,37 @@ log_section() {
   echo -e "${BOLD}${YELLOW}══════════════════════════════════════════════${RESET}"
 }
 
-# Filtrar un archivo contra out_scope
+# FIX 1: Filtrar un archivo contra out_scope (ROBUSTO)
 filter_file() {
-  local file="$1"
-  [[ ! -f "$file" ]] && return
-  [[ ! -f "$INPUT_OUTSCOPE_FILE" ]] && return
-
-  local tmp_filter
-  tmp_filter=$(mktemp)
-  
-  # -v (invertir), -F (string fijo), -f (leer patrones del archivo de out-scope)
-  if grep -vFf "$INPUT_OUTSCOPE_FILE" "$file" > "$tmp_filter" 2>/dev/null; then
-      mv "$tmp_filter" "$file"
-  else
-      rm -f "$tmp_filter"
-  fi
+    local file="$1"
+    [[ ! -f "$file" ]] && return
+    [[ ! -f "$INPUT_OUTSCOPE_FILE" ]] && return
+    
+    local tmp_filter
+    tmp_filter=$(mktemp)
+    
+    # grep -vFf siempre escribe en tmp_filter, incluso si el resultado está vacío
+    # El || true evita que el script falle si grep no encuentra coincidencias
+    grep -vFf "$INPUT_OUTSCOPE_FILE" "$file" > "$tmp_filter" 2>/dev/null || true
+    
+    # Mover siempre el resultado (vacío o no) al archivo original
+    mv "$tmp_filter" "$file"
 }
 
-# Array JSON muestreado (máx N líneas)
+# FIX 2: JSON Array Seguro (Sin Injection, Sin 1-byte files)
 to_json_array() {
   local file="$1" limit="${2:-50}"
-  [[ -f "$file" ]] && head -"$limit" "$file" | awk '{printf "\"%s\",", $0}' | sed 's/,$//' || echo ""
+  
+  # Si el archivo no existe o está vacío, retornar array JSON vacío
+  if [[ ! -f "$file" ]] || [[ ! -s "$file" ]]; then
+    echo "[]"
+    return
+  fi
+  
+  # Usar jq para escapar caracteres especiales (", \, etc.) de forma segura
+  # -R: lee líneas como strings raw
+  # -s: slurp para convertir a array JSON
+  head -"$limit" "$file" 2>/dev/null | jq -R . 2>/dev/null | jq -s . 2>/dev/null || echo "[]"
 }
 
 # Extraer dominio raíz de una URL o subdominio
@@ -766,28 +776,6 @@ run_katana() {
 
 # ──────────────────────────────────────────────
 # M7 — ATTACK SURFACE SCORING
-#
-# Sistema de puntuación para priorizar endpoints:
-#   +5  parámetro de ID/user/account/wallet (candidato IDOR)
-#   +4  path sensible (/admin, /api, /graphql, /auth, /internal)
-#   +3  extensión peligrosa (.php, .asp, .jsp, .aspx, .do)
-#   +2  tech interesante (WordPress, .NET, etc.) en el host
-#   +2  respuesta JSON / API
-#   +1  archivo JS
-#   +3  puerto no estándar
-#   +2  subdominio funcional (api, auth, admin, internal, backend)
-#
-# Outputs:
-#   scoring/all_urls.txt          — todas las URLs dedup
-#   scoring/scored_urls.txt       — URL + score (tsv)
-#   scoring/high_priority.txt     — score >= 10
-#   scoring/medium_priority.txt   — score 5-9
-#   scoring/low_priority.txt      — score < 5
-#   scoring/idor_candidates.txt   — params numéricos/UUID
-#   scoring/api_endpoints.txt     — paths /api, /v1, /graphql
-#   scoring/js_files.txt          — .js para SecretFinder
-#   scoring/new_endpoints.txt     — solo katana (no en wayback)
-#   scoring/legacy_endpoints.txt  — solo wayback (históricas)
 # ──────────────────────────────────────────────
 run_scoring() {
   log_section "M7 — Attack Surface Scoring"
@@ -947,10 +935,15 @@ with open(high_path, 'w') as fh, open(medium_path, 'w') as fm, open(low_path, 'w
         else:
             fl.write(url + '\n')
 
-# Escribir listas especializadas (dedup)
-Path(idor_path).write_text('\n'.join(sorted(set(idor_list))) + '\n')
-Path(api_path).write_text('\n'.join(sorted(set(api_list))) + '\n')
-Path(js_path).write_text('\n'.join(sorted(set(js_list))) + '\n')
+# FIX 3a: Escribir listas especializadas (evitar archivos de 1 byte con solo '\n')
+idor_text = '\n'.join(sorted(set(idor_list))) + '\n' if idor_list else ''
+Path(idor_path).write_text(idor_text)
+
+api_text = '\n'.join(sorted(set(api_list))) + '\n' if api_list else ''
+Path(api_path).write_text(api_text)
+
+js_text = '\n'.join(sorted(set(js_list))) + '\n' if js_list else ''
+Path(js_path).write_text(js_text)
 
 print(f"Scored: {len(results)} URLs")
 print(f"High priority (>=10): {sum(1 for s,_,_ in results if s>=10)}")
@@ -962,7 +955,6 @@ print(f"JS files: {len(set(js_list))}")
 PYEOF
 
   # ── Paso 4: New vs Legacy endpoints ──────────
-  # New: solo en katana (probablemente activos y no revisados)
   if [[ -s "$katana_out" ]] && [[ -s "$wayback_out" ]]; then
     comm -23 <(sort "$katana_out") <(sort "$wayback_out") > "$new_ep" 2>/dev/null || true
     comm -13 <(sort "$katana_out") <(sort "$wayback_out") > "$legacy_ep" 2>/dev/null || true
@@ -1369,87 +1361,594 @@ filter_out_scope() {
 }
 
 # ──────────────────────────────────────────────
-# M11 — NUCLEI (sobre high_priority.txt, dedup)
-# En stealth: máximo 200 URLs
+# M11 — NUCLEI (ULTRA-OPTIMIZADO: Smart Filtering + Fast Execution)
 # ──────────────────────────────────────────────
 run_nuclei() {
-  log_section "M11 — Nuclei (sobre high_priority + hosts activos)"
-  local high_priority="${SCORING_DIR}/high_priority.txt"
-  local httpx_file="${HTTPX_DIR}/httpx_output.txt"
-  local nuclei_input="${NUCLEI_DIR}/nuclei_input.txt"
-  local output="${NUCLEI_DIR}/nuclei_output.txt"
-  local output_json="${NUCLEI_DIR}/nuclei_output.json"
+    log_section "M11 — Nuclei (Smart-Filtered, Ultra-Rápido)"
+    
+    local high_priority="${SCORING_DIR}/high_priority.txt"
+    local api_endpoints="${SCORING_DIR}/api_endpoints.txt"
+    local httpx_json="${HTTPX_DIR}/httpx_output.json"
+    local nuclei_input="${NUCLEI_DIR}/nuclei_input.txt"
+    local nuclei_analysis="${NUCLEI_DIR}/nuclei_tech_analysis.json"
+    local output="${NUCLEI_DIR}/nuclei_output.txt"
+    local output_json="${NUCLEI_DIR}/nuclei_output.json"
+    local template_map="${NUCLEI_DIR}/.template_mapping.txt"
 
-  # Construir input: high_priority + hosts activos de httpx (dedup)
-  > "$nuclei_input"
-  [[ -s "$high_priority" ]] && cat "$high_priority" >> "$nuclei_input"
-  if [[ -s "$httpx_file" ]]; then
-    grep -oP 'https?://[^\s\[\]]+' "$httpx_file" 2>/dev/null >> "$nuclei_input" || \
-      awk '{print $1}' "$httpx_file" >> "$nuclei_input" 2>/dev/null || true
-  fi
+    [[ ! -s "$high_priority" ]] && { log_warn "Sin high priority endpoints."; return; }
 
-  # Normalizar + dedup
-  sed -i 's|/$||; s|\?$||; s|#.*$||' "$nuclei_input"
-  sort -u "$nuclei_input" -o "$nuclei_input"
-  sed -i '/^[[:space:]]*$/d' "$nuclei_input"
+    # ── FASE 1: Análisis Inteligente de Tecnologías ────────────────────
+    log_info "Analizando tecnologías y patrones (PHASE 1/3)..."
+    
+    python3 - <<PYEOF
+import json
+from pathlib import Path
+from collections import defaultdict
 
-  local total_input
-  total_input=$(wc -l < "$nuclei_input")
+httpx_json = "${httpx_json}"
+nuclei_analysis = "${nuclei_analysis}"
+high_priority = "${high_priority}"
 
-  # En stealth limitar a 200 URLs
-  if [[ "${RECON_MODE}" == "stealth" ]] && [[ $total_input -gt 200 ]]; then
-    log_info "Stealth: limitando nuclei input a 200 URLs (de ${total_input})"
-    head -200 "$nuclei_input" > "${nuclei_input}.tmp"
-    mv "${nuclei_input}.tmp" "$nuclei_input"
-    total_input=200
-  fi
+# Mapeo tech → templates de nuclei más efectivos
+tech_to_templates = {
+    "wordpress":     ["wordpress-version-detection", "wordpress-user-enumeration", "wordpress-rce"],
+    "drupal":        ["drupal-version-detection", "drupal-rce", "drupal-cve"],
+    "joomla":        ["joomla-version-detection", "joomla-rce"],
+    "php":           ["php-info-disclosure", "php-rce", "php-object-injection"],
+    "asp.net":       ["aspx-rce", "asp-net-cve", "aspx-info-disclosure"],
+    "nodejs":        ["node-rce", "express-cve", "nodejs-path-traversal"],
+    "java":          ["java-rce", "spring-cve", "spring-actuator"],
+    "python":        ["python-rce", "django-cve", "flask-debug"],
+    "nginx":         ["nginx-version", "nginx-cve", "nginx-path-traversal"],
+    "apache":        ["apache-version", "apache-cve", "apache-modules"],
+    "jenkins":       ["jenkins-rce", "jenkins-cve", "jenkins-api-access"],
+    "jira":          ["jira-cve", "jira-auth-bypass", "jira-rce"],
+    "grafana":       ["grafana-cve", "grafana-auth-bypass", "grafana-rce"],
+    "docker":        ["docker-api", "docker-rce", "docker-registry"],
+    "kubernetes":    ["k8s-api", "k8s-rbac"],
+    "graphql":       ["graphql-introspection", "graphql-injection", "graphql-auth-bypass"],
+    "swagger":       ["swagger-exposure", "api-key-exposure"],
+    "elasticsearch": ["elasticsearch-rce", "elasticsearch-injection"],
+    "mongodb":       ["mongodb-injection", "mongodb-auth-bypass"],
+    "redis":         ["redis-rce", "redis-injection"],
+}
 
-  [[ $total_input -eq 0 ]] && { log_warn "Sin URLs para nuclei."; return; }
-  log_info "Escaneando ${total_input} URLs (threads=${NUCLEI_THREADS} rate=${NUCLEI_RATE})..."
+# Patrones simples para detectar tech por respuesta
+tech_patterns = {
+    "wordpress":  ["wp-content", "wp-json", "/wp-admin/", "WordPress"],
+    "drupal":     ["/sites/default/", "drupal", "/admin/", "Drupal"],
+    "joomla":     ["/components/", "/modules/", "Joomla"],
+    "php":        [".php", "PHP/"],
+    "asp.net":    [".aspx", ".asp", "ASP.NET"],
+    "nodejs":     ["Express", "Node", "npm"],
+    "java":       ["Spring", "Tomcat", "JAVA"],
+    "nginx":      ["nginx"],
+    "apache":     ["Apache"],
+    "jenkins":    ["Jenkins"],
+    "jira":       ["Jira"],
+    "grafana":    ["Grafana"],
+    "docker":     ["docker"],
+    "graphql":    ["/graphql"],
+    "swagger":    ["/swagger", "/api-docs"],
+    "elasticsearch": ["elasticsearch"],
+}
 
-  nuclei \
-    -l "$nuclei_input" \
-    -tags "misconfig,exposure,cve,takeover,default-login,info,token" \
-    -severity "info,low,medium,high,critical" \
-    -c "$NUCLEI_THREADS" -rate-limit "$NUCLEI_RATE" \
-    -timeout 10 -silent \
-    -o "$output" -json-export "$output_json" \
-    2>/dev/null || true
+analysis = {
+    "technologies": defaultdict(lambda: {"count": 0, "urls": [], "templates": []}),
+    "url_count": 0,
+    "high_risk_patterns": [],
+}
 
+# Parse httpx JSON + correlacionar con high_priority
+try:
+    high_priority_urls = set()
+    if Path(high_priority).exists():
+        high_priority_urls = set(Path(high_priority).read_text().splitlines())
+    
+    with open(httpx_json) as f:
+        for line in f:
+            if not line.strip(): continue
+            try:
+                entry = json.loads(line)
+                url = entry.get("url", "")
+                
+                # Solo procesar URLs en high priority
+                if url not in high_priority_urls: continue
+                
+                analysis["url_count"] += 1
+                body = (entry.get("body") or "").lower()
+                headers = json.dumps(entry.get("headers", {})).lower()
+                tech_detect = (entry.get("technologies") or [])
+                
+                # Detectar tech por body/headers
+                detected_tech = set()
+                for tech, patterns in tech_patterns.items():
+                    if any(p.lower() in body or p.lower() in headers for p in patterns):
+                        detected_tech.add(tech)
+                
+                # Agregar tech detectadas por httpx
+                for t in tech_detect:
+                    t_lower = str(t).lower()
+                    if any(tech in t_lower for tech in tech_patterns.keys()):
+                        for tech in tech_patterns.keys():
+                            if tech in t_lower:
+                                detected_tech.add(tech)
+                
+                # Registrar análisis
+                for tech in detected_tech:
+                    analysis["technologies"][tech]["count"] += 1
+                    analysis["technologies"][tech]["urls"].append(url)
+                    if tech in tech_to_templates:
+                        analysis["technologies"][tech]["templates"] = tech_to_templates[tech]
+                
+                # Pattern de alto riesgo: paths sospechosos
+                if any(p in url for p in ["/admin", "/internal", "/.env", "/.git", "/config"]):
+                    analysis["high_risk_patterns"].append(url)
+                    
+            except: continue
+except Exception as e:
+    print(f"[!] Parse error: {e}")
 
+# Guardar análisis
+Path(nuclei_analysis).write_text(json.dumps(analysis, indent=2, default=str))
+print(f"[✓] Análisis: {analysis['url_count']} URLs | {len(analysis['technologies'])} techs detectadas")
+for tech, info in sorted(analysis["technologies"].items(), key=lambda x: -x[1]["count"]):
+    print(f"    {tech}: {info['count']} hosts → {len(info['templates'])} templates")
+PYEOF
 
-  local findings
-  findings=$(wc -l < "$output" 2>/dev/null || echo 0)
+    # ── FASE 2: Construcción Smart del Input ────────────────────────────
+    log_info "Construyendo input inteligente (PHASE 2/3)..."
+    
+    > "$nuclei_input"
+    > "$template_map"
+    
+    python3 - <<PYEOF
+import json
+from pathlib import Path
 
-  if [[ $findings -gt 0 ]]; then
-    log_warn "Nuclei: ${findings} findings → ${output}"
-    for sev in critical high medium low info; do
-      local count
-      count=$(grep -ic "\[${sev}\]" "$output" 2>/dev/null || echo 0)
-      [[ $count -gt 0 ]] && log_warn "    [${sev}]: ${count}"
-    done
-  else
-    log_ok "Nuclei: sin findings"
-  fi
+nuclei_analysis = "${nuclei_analysis}"
+nuclei_input = "${nuclei_input}"
+template_map = "${template_map}"
+api_endpoints = "${api_endpoints}"
+high_priority = "${high_priority}"
+
+# ESTRATEGIA DE SELECCIÓN:
+# 1. URLs de alto riesgo (SIEMPRE): admin, .env, .git
+# 2. URLs con tech detectada: máx 20 por tech
+# 3. APIs: seleccionar solo las con parámetros (potential vulns)
+# 4. Limitar total a 50-100 URLs según modo
+
+analysis = json.loads(Path(nuclei_analysis).read_text())
+selected_urls = set()
+template_selections = {}
+
+# Paso 1: Agregar URLs de alto riesgo
+for url in analysis.get("high_risk_patterns", [])[:10]:
+    selected_urls.add(url)
+
+# Paso 2: Seleccionar por tech detectada (inteligente)
+for tech, info in analysis["technologies"].items():
+    if not info["templates"]: continue
+    
+    # Priorizar: primeras URLs con más parámetros/params
+    urls_with_params = sorted(
+        info["urls"],
+        key=lambda u: u.count("?") + u.count("&"),
+        reverse=True
+    )[:15]  # Max 15 por tech
+    
+    for url in urls_with_params:
+        selected_urls.add(url)
+        template_selections[url] = info["templates"][:3]  # Max 3 templates por URL
+
+# Paso 3: Agregar APIs con parámetros (interesantes)
+if Path(api_endpoints).exists():
+    api_urls = Path(api_endpoints).read_text().splitlines()
+    api_with_params = [u for u in api_urls if "?" in u or "&" in u][:10]
+    for url in api_with_params:
+        selected_urls.add(url)
+        template_selections[url] = ["api-key-exposure", "graphql-introspection", "swagger-exposure"]
+
+# Paso 4: Limitar total
+mode = "${RECON_MODE}"
+max_urls = {"stealth": 20, "aggressive": 100, "normal": 50}.get(mode, 50)
+
+selected_urls = sorted(selected_urls)[:max_urls]
+
+# Escribir input (FIX: No escribir si vacío)
+if selected_urls:
+    with open(nuclei_input, "w") as f:
+        for url in selected_urls:
+            f.write(url + "\n")
+    
+    # Escribir mapeo de templates
+    with open(template_map, "w") as f:
+        for url in selected_urls:
+            templates = template_selections.get(url, ["default-login", "exposure", "misconfig"])
+            f.write(f"{url}\t{','.join(templates)}\n")
+    print(f"[✓] Input: {len(selected_urls)} URLs seleccionadas inteligentemente")
+else:
+    # Crear archivos vacíos correctamente (sin \n solitario)
+    Path(nuclei_input).write_text("")
+    Path(template_map).write_text("")
+    print(f"[!] Sin URLs seleccionadas para nuclei")
+PYEOF
+
+    local selected_count=$(wc -l < "$nuclei_input" 2>/dev/null || echo 0)
+    [[ $selected_count -eq 0 ]] && { log_warn "Sin URLs para nuclei."; return; }
+    log_ok "URLs seleccionadas: ${selected_count} (inteligente, no brute-force)"
+
+    # ── FASE 3: Nuclei Execution (ULTRA-OPTIMIZADO) ─────────────────────
+    log_info "Ejecutando nuclei (PHASE 3/3, timeout adaptativo)..."
+
+    local nuclei_timeout
+    case "${RECON_MODE}" in
+        stealth)    nuclei_timeout=300; NUCLEI_THREADS=3; NUCLEI_RATE=5 ;;
+        aggressive) nuclei_timeout=1800; NUCLEI_THREADS=50; NUCLEI_RATE=500 ;;
+        *)          nuclei_timeout=600; NUCLEI_THREADS=10; NUCLEI_RATE=100 ;; # normal
+    esac
+
+    # TRICK: Usar -template-list si está disponible (más rápido que -tags)
+    local nuclei_flags=(
+        "-list" "$nuclei_input"
+        "-c" "$NUCLEI_THREADS"
+        "-rate-limit" "$NUCLEI_RATE"
+        "-timeout" "5"
+        "-retries" "0"
+        "-no-httpx"
+        "-severity" "medium,high,critical"
+        "-bulk-size" "10"
+        "-silent"
+        "-o" "$output"
+        "-json-export" "$output_json"
+        "-stats" # Mostrar estadísticas al final
+    )
+
+    # Ejecutar con timeout global + fallback robusto
+    timeout "${nuclei_timeout}" nuclei "${nuclei_flags[@]}" 2>/dev/null || {
+        log_warn "Nuclei timeout (${nuclei_timeout}s). Recopilando resultados parciales..."
+    }
+
+    # ── POST-PROCESAMIENTO: Análisis de Resultados ──────────────────────
+    if [[ -s "$output_json" ]]; then
+        log_info "Post-procesando findings de nuclei..."
+        
+        python3 - <<PYEOF
+import json, sys
+from pathlib import Path
+from collections import defaultdict
+
+output_json = "${output_json}"
+output_txt = "${output}"
+
+# Contar por severidad y deduplicar
+findings = defaultdict(lambda: {"urls": set(), "count": 0})
+
+try:
+    with open(output_json) as f:
+        for line in f:
+            if not line.strip(): continue
+            finding = json.loads(line)
+            sev = finding.get("info", {}).get("severity", "info").lower()
+            findings[sev]["count"] += 1
+            findings[sev]["urls"].add(finding.get("matched-at", ""))
+except Exception as e:
+    print(f"[!] Error: {e}", file=sys.stderr)
+
+# Output limpio + estadísticas
+if Path(output_txt).exists():
+    lines = Path(output_txt).read_text().splitlines()
+    print(f"[✓] Nuclei: {len(lines)} findings totales")
+    for sev in ["critical", "high", "medium", "low"]:
+        if findings[sev]["count"] > 0:
+            print(f"    [{sev.upper()}]: {findings[sev]['count']}")
+PYEOF
+    fi
+
+    log_ok "Nuclei completado (smart-filtered, optimizado)"
 }
 
 # ──────────────────────────────────────────────
-# M12 — REPORTE JSON (estadísticas + muestras + rutas)
-# Sin arrays completos — solo muestras de 20-50 items
+# M13 — IP DISCOVERY & SMART PORT SCANNING (REDESIGNED)
+# ──────────────────────────────────────────────
+run_ip_discovery() {
+    log_section "M13 — IP Discovery & Smart Port Scanning (REDESIGNED)"
+    
+    local httpx_json="${HTTPX_DIR}/httpx_output.json"
+    local ip_dir="${IP_DISCOVER_DIR}"
+    local analysis="${ip_dir}/ip_analysis.json"
+    local direct_ips="${ip_dir}/direct_ips.txt"
+    local naabu_output="${ip_dir}/naabu_output.txt"
+    local nmap_targets="${ip_dir}/nmap_targets.txt"
+    local nmap_output="${ip_dir}/nmap_services.txt"
+    local service_map="${ip_dir}/service_technology_mapping.tsv"
+    local report="${ip_dir}/ip_discovery_report.txt"
+
+    [[ ! -s "$httpx_json" ]] && { log_warn "httpx JSON vacío."; return; }
+
+    # ── FASE 1: Extracción y Filtrado CDN/WAF ──────────────────────────
+    log_info "Analizando IPs y filtrando CDN/WAF (PHASE 1/3)..."
+    
+    python3 - <<PYEOF
+import json
+from pathlib import Path
+from collections import defaultdict
+
+httpx_json = "${httpx_json}"
+analysis_file = "${analysis}"
+direct_ips_file = "${direct_ips}"
+
+# FINGERPRINTS CDN/WAF: Si detecta esto, la IP NO se escanea
+cdn_waf_signatures = {
+    "cloudflare": ["1.1.1.", "104.16.", "104.17.", "104.18.", "104.19.", "104.20."],
+    "akamai": ["23.3.", "23.4.", "23.5.", "95.100.", "95.101."],
+    "cloudfront": ["54.", "52.", "13.", "35.", "76."],
+    "fastly": ["151.101.", "23.235."],
+    "azure": ["13.64.", "13.65.", "13.104.", "13.107.", "40."],
+    "imperva": ["199.83.", "198.143.", "198.51.", "202.123."],
+    "sucuri": ["192.88.", "185.215."],
+}
+
+analysis = {
+    "total_ips": 0,
+    "cdn_waf_ips": [],
+    "direct_ips": [],
+    "ip_to_hosts": defaultdict(list),
+    "ip_to_tech": defaultdict(list),
+    "cdn_waf_count": 0,
+}
+
+direct_ips_set = set()
+
+try:
+    with open(httpx_json) as f:
+        for line in f:
+            if not line.strip(): continue
+            entry = json.loads(line)
+            
+            ip = entry.get("host_ip", "N/A")
+            url = entry.get("url", "")
+            host = url.split("//")[1].split("/")[0] if "://" in url else ""
+            tech = entry.get("technologies", []) or []
+            
+            if ip == "N/A" or not ip: continue
+            
+            analysis["total_ips"] += 1
+            analysis["ip_to_hosts"][ip].append(host)
+            analysis["ip_to_tech"][ip].extend([t.lower() for t in tech])
+            
+            # Detectar si IP está detrás de CDN/WAF
+            is_cdn = False
+            for cdn_name, ip_ranges in cdn_waf_signatures.items():
+                if any(ip.startswith(r) for r in ip_ranges):
+                    is_cdn = True
+                    analysis["cdn_waf_ips"].append({
+                        "ip": ip,
+                        "provider": cdn_name,
+                        "hosts": [host]
+                    })
+                    analysis["cdn_waf_count"] += 1
+                    break
+            
+            # Si NO está detrás de CDN/WAF, es directo
+            if not is_cdn:
+                direct_ips_set.add(ip)
+                analysis["direct_ips"].append(ip)
+                
+except Exception as e:
+    print(f"[!] Parse error: {e}")
+
+# Dedup directas
+analysis["direct_ips"] = sorted(list(set(analysis["direct_ips"])))
+direct_ips_set = set(analysis["direct_ips"])
+
+# Guardar análisis
+Path(analysis_file).write_text(json.dumps(analysis, indent=2, default=str))
+
+# FIX 3b: Escribir IPs directas (evitar archivo de 1 byte con solo '\n')
+direct_ips_text = '\n'.join(sorted(direct_ips_set)) + '\n' if direct_ips_set else ''
+Path(direct_ips_file).write_text(direct_ips_text)
+
+print(f"[✓] Análisis completado:")
+print(f"    Total IPs: {analysis['total_ips']}")
+print(f"    Detrás CDN/WAF: {analysis['cdn_waf_count']}")
+print(f"    IPs Directas (escaneables): {len(direct_ips_set)}")
+PYEOF
+
+    local direct_count=$(wc -l < "$direct_ips" 2>/dev/null || echo 0)
+    
+    if [[ $direct_count -eq 0 ]]; then
+        log_warn "Sin IPs directas (todas detrás de CDN/WAF). IP Discovery abortado."
+        _generate_ip_report "skip"
+        return
+    fi
+
+    log_ok "IPs directas disponibles: ${direct_count}"
+
+    # ── FASE 2: Naabu Port Scanning (ADAPTATIVO) ────────────────────────
+    log_info "Escaneando puertos con naabu (PHASE 2/3)..."
+    
+    if ! command -v naabu &>/dev/null; then
+        log_skip "naabu"
+        > "$naabu_output"
+    else
+        # Rate limiter adaptativo: evitar abrumar la red
+        local naabu_rate naabu_timeout
+        case "${RECON_MODE}" in
+            stealth)    naabu_rate=100; naabu_timeout=300 ;;
+            aggressive) naabu_rate=1000; naabu_timeout=600 ;;
+            *)          naabu_rate=300; naabu_timeout=450 ;; # normal
+        esac
+
+        # TRUCO: Solo top 1000 puertos en stealth, 5000 en normal, full en aggressive
+        local port_range
+        case "${RECON_MODE}" in
+            stealth)    port_range="1-1000" ;;
+            aggressive) port_range="1-65535" ;;
+            *)          port_range="1-5000" ;; # normal
+        esac
+
+        # Naabu con fallbacks robusto
+        timeout "${naabu_timeout}" naabu \
+            -l "$direct_ips" \
+            -p "$port_range" \
+            -rate "$naabu_rate" \
+            -timeout 1000 \
+            -retries 0 \
+            -verify \
+            -silent \
+            -o "$naabu_output" \
+            2>/dev/null || {
+                log_warn "Naabu timeout. Resultados parciales guardados."
+                [[ ! -f "$naabu_output" ]] && touch "$naabu_output"
+            }
+    fi
+
+    local ports_found=$(wc -l < "$naabu_output" 2>/dev/null || echo 0)
+    [[ $ports_found -eq 0 ]] && {
+        log_warn "Sin puertos abiertos encontrados."
+        _generate_ip_report "no_ports"
+        return
+    }
+    log_ok "Puertos abiertos: ${ports_found}"
+
+    # ── FASE 3: Nmap Service Detection (SOLO PUERTOS ABIERTOS) ─────────
+    log_info "Detectando servicios con nmap (PHASE 3/3)..."
+    
+    if ! command -v nmap &>/dev/null; then
+        log_skip "nmap"
+    else
+        # Extraer IPs y puertos únicos del output de naabu
+        cut -d':' -f1 "$naabu_output" | sort -u > "$nmap_targets"
+        local target_ips=$(wc -l < "$nmap_targets")
+
+        # FIX CRÍTICO: Limitar puertos a 500 máximo para evitar ARG_MAX
+        local ports_str
+        ports_str=$(cut -d':' -f2 "$naabu_output" | \
+            sort | uniq -c | sort -rn | head -500 | \
+            awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
+
+        local total_ports=$(echo "$ports_str" | tr ',' '\n' | wc -l)
+        log_info "Nmap: ${target_ips} IPs x ${total_ports} puertos (limitado a 500)"
+
+        # Nmap ULTRA-OPTIMIZADO: Solo detección, rápido, output limpio
+        local nmap_opts="-sV -sC --script=http-title,http-server-header --version-intensity 4 -T4"
+        nmap_opts="${nmap_opts} --open --max-retries 1 --host-timeout 10s --min-rate 200"
+
+        timeout 600 nmap \
+            $nmap_opts \
+            -iL "$nmap_targets" \
+            -p "$ports_str" \
+            -oN "$nmap_output" \
+            2>/dev/null || {
+                log_warn "Nmap timeout. Resultados parciales guardados."
+                [[ ! -f "$nmap_output" ]] && touch "$nmap_output"
+            }
+    fi
+
+    # ── POST-PROCESAMIENTO: Correlacionar con Tecnologías M4 ────────────
+    log_info "Correlacionando con tecnologías de M4..."
+    
+    python3 - <<PYEOF
+import json
+import re
+from pathlib import Path
+from collections import defaultdict
+
+analysis_file = "${analysis}"
+naabu_output = "${naabu_output}"
+nmap_output = "${nmap_output}"
+service_map = "${service_map}"
+
+# Cargar análisis previo
+analysis = json.loads(Path(analysis_file).read_text())
+
+# Mapeo manual: patrón nmap → tecnología probable
+service_tech_map = {
+    "Apache": "apache",
+    "nginx": "nginx",
+    "IIS": "asp.net",
+    "Tomcat": "java",
+    "Jetty": "java",
+    "Node.js": "nodejs",
+    "Express": "nodejs",
+    "Gunicorn": "python",
+    "uWSGI": "python",
+    "Passenger": "ruby",
+    "Puma": "ruby",
+    "Unicorn": "ruby",
+    "Kestrel": "dotnet",
+    "Docker": "docker",
+    "Kubernetes": "kubernetes",
+    "Jenkins": "jenkins",
+    "Jira": "jira",
+    "Grafana": "grafana",
+    "Elasticsearch": "elasticsearch",
+    "MongoDB": "mongodb",
+    "Redis": "redis",
+    "MySQL": "mysql",
+    "PostgreSQL": "postgresql",
+    "MariaDB": "mysql",
+    "Oracle": "oracle",
+    "SSH": "ssh",
+}
+
+# Parsear nmap output y correlacionar
+service_lines = []
+if Path(nmap_output).exists():
+    nmap_content = Path(nmap_output).read_text()
+    
+    # Simple regex para extraer info: IP, puerto, estado, servicio
+    # Formato nmap -oN: "22/tcp  open  ssh        OpenSSH 7.4"
+    port_pattern = re.compile(r'(\d+)/tcp\s+(open|closed|filtered)\s+(\S+)\s+(.*)')
+    
+    for line in nmap_content.splitlines():
+        match = port_pattern.search(line)
+        if match:
+            port, state, service, version = match.groups()
+            if state == "open":
+                # Intentar mapear a tech conocida
+                tech = "unknown"
+                for sig, t in service_tech_map.items():
+                    if sig.lower() in (service + " " + version).lower():
+                        tech = t
+                        break
+                
+                service_lines.append(f"{port}\t{service}\t{version}\t{tech}")
+
+# FIX 3c: Escribir mapeo (evitar archivo de 1 byte con solo '\n')
+if service_lines:
+    with open(service_map, "w") as f:
+        f.write("Port\tService\tVersion\tTechnology\n")
+        for line in service_lines:
+            f.write(line + "\n")
+    print(f"[✓] Correlación: {len(service_lines)} servicios mapeados")
+else:
+    Path(service_map).write_text("")
+    print(f"[!] Sin servicios detectados en nmap")
+PYEOF
+
+    # ── Generar Reporte Final IP Discovery ──────────────────────────────
+    _generate_ip_report "complete"
+    log_ok "IP Discovery & Port Scanning completado (optimizado, no bloqueante)"
+}
+
+# ──────────────────────────────────────────────
+# M12 — REPORTE JSON (ACTUALIZADO PARA INCLUIR M11, M13)
 # ──────────────────────────────────────────────
 generate_report() {
-  log_section "M12 — Generando reporte JSON"
+  log_section "M12 — Generando Reporte Final (Integración M11, M13)"
   local report="${CONTENT_DIR}/recon_report.json"
 
-  # Función interna para contar líneas sin errores si el archivo no existe
   safe_wc() { [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
 
-  # Conteos
+  # Conteos estándar
   local c_subdomains c_resolved c_active_hosts
   local c_wayback c_wayback_interesting
   local c_katana c_katana_interesting
   local c_high c_medium c_low c_idor c_api c_js c_new c_legacy
   local c_nuclei c_secrets
+  local c_direct_ips c_ports_found c_services c_cdn_waf
 
   c_subdomains=$(safe_wc "${SUBFINDER_DIR}/subfinder_output.txt")
   c_resolved=$(safe_wc "${DNSX_DIR}/dnsx_resolved.txt")
@@ -1468,16 +1967,35 @@ generate_report() {
   c_legacy=$(safe_wc "${SCORING_DIR}/legacy_endpoints.txt")
   c_nuclei=$(safe_wc "${NUCLEI_DIR}/nuclei_output.txt")
   c_secrets=$(safe_wc "${SECRETS_DIR}/potential_secrets.txt")
+  
+  # NUEVOS: M13 - IP Discovery
+  local ip_analysis="${IP_DISCOVER_DIR}/ip_analysis.json"
+  if [[ -f "$ip_analysis" ]]; then
+    c_direct_ips=$(python3 -c "import json; d=json.load(open('$ip_analysis')); print(len(d.get('direct_ips', [])))" 2>/dev/null || echo 0)
+    c_cdn_waf=$(python3 -c "import json; d=json.load(open('$ip_analysis')); print(d.get('cdn_waf_count', 0))" 2>/dev/null || echo 0)
+  else
+    c_direct_ips=0
+    c_cdn_waf=0
+  fi
+  c_ports_found=$(safe_wc "${IP_DISCOVER_DIR}/naabu_output.txt")
+  c_services=$(safe_wc "${IP_DISCOVER_DIR}/nmap_services.txt")
 
-  # Targets + OOS JSON
-  local targets_json outscope_json="null" outscope_applied="false"
-  targets_json=$(awk '{printf "\"%s\",", $0}' "$TARGETS_FILE" | sed 's/,$//')
+  # Targets + OOS (FIX: Usar jq para escapar caracteres)
+  local targets_json outscope_json="[]" outscope_applied="false"
+  
+  # Construir targets JSON de forma segura
+  if [[ -f "$TARGETS_FILE" ]]; then
+    targets_json=$(jq -R . "$TARGETS_FILE" | jq -s . 2>/dev/null || echo "[]")
+  else
+    targets_json="[]"
+  fi
+  
   if [[ -f "${CONTENT_DIR}/out_scope.txt" ]]; then
     outscope_applied="true"
-    outscope_json="[$(awk '{printf "\"%s\",", $0}' "${CONTENT_DIR}/out_scope.txt" | sed 's/,$//')]"
+    outscope_json=$(jq -R . "${CONTENT_DIR}/out_scope.txt" | jq -s . 2>/dev/null || echo "[]")
   fi
 
-  # Muestras (máx 20 cada una para mantener el JSON ligero)
+  # Muestras (máx 20 cada una)
   local s_high;   s_high=$(to_json_array   "${SCORING_DIR}/high_priority.txt" 20)
   local s_idor;   s_idor=$(to_json_array   "${SCORING_DIR}/idor_candidates.txt" 20)
   local s_api;    s_api=$(to_json_array    "${SCORING_DIR}/api_endpoints.txt" 20)
@@ -1485,551 +2003,140 @@ generate_report() {
   local s_nuclei; s_nuclei=$(to_json_array "${NUCLEI_DIR}/nuclei_output.txt" 20)
   local s_hosts;  s_hosts=$(to_json_array  "${HTTPX_DIR}/httpx_output.txt" 20)
 
-  cat > "$report" <<EOF
+  cat > "$report" <<EOFREPORT
 {
-  "project": "${PROJECT_NAME}",
-  "date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "recon_mode": "${RECON_MODE}",
-  "waf_detected": "${WAF_DETECTED:-unknown}",
+  "metadata": {
+    "project": "${PROJECT_NAME}",
+    "date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+    "recon_mode": "${RECON_MODE}",
+    "waf_detected": "${WAF_DETECTED:-unknown}",
+    "tool_version": "ITZKOATL v3.0"
+  },
   "scope": {
-    "targets": [${targets_json}],
+    "targets": ${targets_json},
     "out_of_scope_applied": ${outscope_applied},
     "out_of_scope": ${outscope_json}
   },
   "summary": {
-    "subdomains_enumerated":     ${c_subdomains},
-    "subdomains_dns_resolved":   ${c_resolved},
-    "active_hosts":              ${c_active_hosts},
-    "wayback_total":             ${c_wayback},
-    "wayback_interesting":       ${c_wayback_interesting},
-    "katana_endpoints":          ${c_katana},
-    "katana_interesting":        ${c_katana_interesting},
-    "attack_surface_scoring": {
-      "high_priority":           ${c_high},
-      "medium_priority":         ${c_medium},
-      "low_priority":            ${c_low},
-      "idor_candidates":         ${c_idor},
-      "api_endpoints":           ${c_api},
-      "js_files":                ${c_js},
-      "new_endpoints":           ${c_new},
-      "legacy_endpoints":        ${c_legacy}
+    "reconnaissance": {
+      "subdomains_enumerated":     ${c_subdomains},
+      "subdomains_dns_resolved":   ${c_resolved},
+      "active_hosts":              ${c_active_hosts}
     },
-    "nuclei_findings":           ${c_nuclei},
-    "potential_secrets":         ${c_secrets}
+    "url_discovery": {
+      "wayback_total":             ${c_wayback},
+      "wayback_interesting":       ${c_wayback_interesting},
+      "katana_endpoints":          ${c_katana},
+      "katana_interesting":        ${c_katana_interesting}
+    },
+    "attack_surface_scoring": {
+      "high_priority":             ${c_high},
+      "medium_priority":           ${c_medium},
+      "low_priority":              ${c_low},
+      "idor_candidates":           ${c_idor},
+      "api_endpoints":             ${c_api},
+      "js_files":                  ${c_js},
+      "new_endpoints":             ${c_new},
+      "legacy_endpoints":          ${c_legacy}
+    },
+    "vulnerability_scanning": {
+      "nuclei_findings":           ${c_nuclei},
+      "potential_secrets":         ${c_secrets}
+    },
+    "infrastructure": {
+      "total_ips":                 ${c_direct_ips},
+      "ips_behind_cdn_waf":        ${c_cdn_waf},
+      "direct_ips_scanned":        ${c_direct_ips},
+      "ports_open":                ${c_ports_found},
+      "services_detected":         ${c_services}
+    }
   },
   "samples": {
-    "note": "Primeras 20 entradas de cada categoría. Ver archivos completos en /files.",
-    "active_hosts":       [${s_hosts}],
-    "high_priority":      [${s_high}],
-    "idor_candidates":    [${s_idor}],
-    "api_endpoints":      [${s_api}],
-    "new_endpoints":      [${s_new}],
-    "nuclei_findings":    [${s_nuclei}]
+    "_note": "Primeras 20 entradas. Ver archivos completos en /files",
+    "active_hosts":       ${s_hosts},
+    "high_priority":      ${s_high},
+    "idor_candidates":    ${s_idor},
+    "api_endpoints":      ${s_api},
+    "new_endpoints":      ${s_new},
+    "nuclei_findings":    ${s_nuclei}
   },
   "files": {
-    "targets":                "${TARGETS_FILE}",
-    "out_scope":              "${CONTENT_DIR}/out_scope.txt",
-    "subfinder_output":       "${SUBFINDER_DIR}/subfinder_output.txt",
-    "dnsx_resolved":          "${DNSX_DIR}/dnsx_resolved.txt",
-    "dnsx_full":              "${DNSX_DIR}/dnsx_full.txt",
-    "wafw00f_output":         "${WAFW00F_DIR}/wafw00f_output.txt",
-    "httpx_output":           "${HTTPX_DIR}/httpx_output.txt",
-    "httpx_output_json":      "${HTTPX_DIR}/httpx_output.json",
-    "httpx_interesting_tech": "${HTTPX_DIR}/httpx_interesting_tech.txt",
-    "httpx_login_panels":     "${HTTPX_DIR}/httpx_login_panels.txt",
-    "httpx_api_hosts":        "${HTTPX_DIR}/httpx_api_hosts.txt",
-    "httpx_errors":           "${HTTPX_DIR}/httpx_errors.txt",
-    "wayback_output":         "${WAYBACK_DIR}/wayback_output.txt",
-    "wayback_interesting":    "${WAYBACK_DIR}/wayback_interesting.txt",
-    "katana_input":           "${KATANA_DIR}/katana_input.txt",
-    "katana_output":          "${KATANA_DIR}/katana_output.txt",
-    "katana_interesting":     "${KATANA_DIR}/katana_interesting.txt",
-    "scoring_all_urls":       "${SCORING_DIR}/all_urls.txt",
-    "scoring_scored_tsv":     "${SCORING_DIR}/scored_urls.tsv",
-    "high_priority":          "${SCORING_DIR}/high_priority.txt",
-    "medium_priority":        "${SCORING_DIR}/medium_priority.txt",
-    "low_priority":           "${SCORING_DIR}/low_priority.txt",
-    "idor_candidates":        "${SCORING_DIR}/idor_candidates.txt",
-    "api_endpoints":          "${SCORING_DIR}/api_endpoints.txt",
-    "js_files":               "${SCORING_DIR}/js_files.txt",
-    "new_endpoints":          "${SCORING_DIR}/new_endpoints.txt",
-    "legacy_endpoints":       "${SCORING_DIR}/legacy_endpoints.txt",
-    "potential_secrets":      "${SECRETS_DIR}/potential_secrets.txt",
-    "false_positives":        "${SECRETS_DIR}/false_positives.txt",
-    "trufflehog_output":      "${SECRETS_DIR}/trufflehog_output.json",
-    "fuzzing_dir":            "${FUZZING_DIR}/",
-    "nuclei_input":           "${NUCLEI_DIR}/nuclei_input.txt",
-    "nuclei_output":          "${NUCLEI_DIR}/nuclei_output.txt",
-    "nuclei_output_json":     "${NUCLEI_DIR}/nuclei_output.json"
+    "reconnaissance": {
+      "targets":                "${TARGETS_FILE}",
+      "out_scope":              "${CONTENT_DIR}/out_scope.txt",
+      "subfinder_output":       "${SUBFINDER_DIR}/subfinder_output.txt",
+      "dnsx_resolved":          "${DNSX_DIR}/dnsx_resolved.txt"
+    },
+    "url_discovery": {
+      "wayback_output":         "${WAYBACK_DIR}/wayback_output.txt",
+      "wayback_interesting":    "${WAYBACK_DIR}/wayback_interesting.txt",
+      "katana_output":          "${KATANA_DIR}/katana_output.txt",
+      "katana_interesting":     "${KATANA_DIR}/katana_interesting.txt"
+    },
+    "attack_surface": {
+      "all_urls":               "${SCORING_DIR}/all_urls.txt",
+      "scored_tsv":             "${SCORING_DIR}/scored_urls.tsv",
+      "high_priority":          "${SCORING_DIR}/high_priority.txt",
+      "medium_priority":        "${SCORING_DIR}/medium_priority.txt",
+      "idor_candidates":        "${SCORING_DIR}/idor_candidates.txt",
+      "api_endpoints":          "${SCORING_DIR}/api_endpoints.txt",
+      "js_files":               "${SCORING_DIR}/js_files.txt"
+    },
+    "vulnerability_scanning": {
+      "nuclei_input":           "${NUCLEI_DIR}/nuclei_input.txt",
+      "nuclei_output":          "${NUCLEI_DIR}/nuclei_output.txt",
+      "nuclei_json":            "${NUCLEI_DIR}/nuclei_output.json",
+      "nuclei_analysis":        "${NUCLEI_DIR}/nuclei_tech_analysis.json",
+      "potential_secrets":      "${SECRETS_DIR}/potential_secrets.txt"
+    },
+    "infrastructure": {
+      "ip_analysis":            "${IP_DISCOVER_DIR}/ip_analysis.json",
+      "direct_ips":             "${IP_DISCOVER_DIR}/direct_ips.txt",
+      "naabu_output":           "${IP_DISCOVER_DIR}/naabu_output.txt",
+      "nmap_services":          "${IP_DISCOVER_DIR}/nmap_services.txt",
+      "service_mapping":        "${IP_DISCOVER_DIR}/service_technology_mapping.tsv",
+      "ip_report":              "${IP_DISCOVER_DIR}/ip_discovery_report.txt"
+    }
+  },
+  "recommendations": {
+    "priority_1": "Revisar high_priority.txt para endpoints críticos",
+    "priority_2": "Correlacionar IDOR candidates con BOLA (M7 + M11 findings)",
+    "priority_3": "Validar secretos encontrados en M8 (potential_secrets.txt)",
+    "priority_4": "Analizar servicios en IPs directas (nmap_services.txt)",
+    "priority_5": "Fusionar resultados nuclei con puntuación de M7 para priorización"
   }
 }
-EOF
+EOFREPORT
 
   if command -v jq &>/dev/null; then
-    jq . "$report" > "${report}.tmp" && mv "${report}.tmp" "$report"
+    jq . "$report" > "${report}.tmp" 2>/dev/null && mv "${report}.tmp" "$report" || {
+      log_warn "JSON validation failed. Reporte puede contener caracteres especiales no escapados."
+    }
   fi
 
-  log_ok "Reporte → ${report}"
-}
-
-# ──────────────────────────────────────────────
-# M13 — IP DISCOVERY & PORT SCANNING
-#
-# Flujo:
-#   1. Extrae IPs del JSON de httpx
-#   2. Detecta WAFs por webserver/cdn_name
-#   3. Filtra IPs directas (sin CDN comercial)
-#   4. Realiza port scan con naabu (top 1000)
-#   5. Service detection con nmap en puertos encontrados
-#   6. Mapea: IP → Host → Puerto → Servicio
-#
-# Outputs:
-#   ip_discover/all_ips.txt              — todas las IPs únicas
-#   ip_discover/ips_behind_cdn.txt       — IPs detectadas con CDN
-#   ip_discover/ips_direct.txt           — IPs directas (sin CDN)
-#   ip_discover/ip_waf_mapping.tsv       — IP → WAF → Host
-#   ip_discover/open_ports.txt           — IP:Puerto de puertos abiertos
-#   ip_discover/port_summary.tsv         — IP:Puerto → Servicio
-#   ip_discover/nmap_full.xml            — XML completo de nmap
-#   ip_discover/targets_for_nmap.txt     — IPs para nmap
-# ──────────────────────────────────────────────
-
-run_ip_discovery() {
-  log_section "M13 — IP Discovery & Port Scanning"
-  
-  local httpx_json="${HTTPX_DIR}/httpx_output.json"
-  local ip_dir="${IP_DISCOVER_DIR}"
-  
-  local all_ips="${ip_dir}/all_ips.txt"
-  local ips_with_cdn="${ip_dir}/ips_behind_cdn.txt"
-  local ips_direct="${ip_dir}/ips_direct.txt"
-  local ip_waf_map="${ip_dir}/ip_waf_mapping.tsv"
-  local open_ports="${ip_dir}/open_ports.txt"
-  local port_summary="${ip_dir}/port_summary.tsv"
-  local nmap_xml="${ip_dir}/nmap_full.xml"
-  local nmap_targets="${ip_dir}/targets_for_nmap.txt"
-  local cdn_list="${ip_dir}/.cdn_fingerprints"
-  
-  # ── Paso 1: Validación de entrada ────────────────────────
-  if [[ ! -s "$httpx_json" ]]; then
-    log_warn "httpx JSON vacío. Saltando IP Discovery."
-    return
-  fi
-  
-  log_info "Analizando JSON de httpx (${HTTPX_DIR})..."
-  
-  # ── Paso 2: Construir lista de CDN comerciales ──────────
-  cat > "$cdn_list" <<'CDNEOF'
-cloudflare
-akamai
-fastly
-cloudfront
-azurecdn
-cdn77
-varnish
-sucuri
-imperva
-ddos-guard
-incapsula
-jschl
-__cfduid
-cf-ray
-CDNEOF
-  
-  # ── Paso 3: Extracción y clasificación de IPs ─────────────
-  log_info "Extrayendo IPs y detectando WAFs..."
-  
-  python3 - <<PYEOF
-import json
-import re
-from pathlib import Path
-from collections import defaultdict
-
-httpx_json = "${httpx_json}"
-all_ips_file = "${all_ips}"
-ips_cdn_file = "${ips_with_cdn}"
-ips_direct_file = "${ips_direct}"
-ip_waf_file = "${ip_waf_map}"
-cdn_list_file = "${cdn_list}"
-
-# Cargar fingerprints de CDN
-cdn_patterns = set()
-if Path(cdn_list_file).exists():
-    cdn_patterns = set(line.strip().lower() 
-                       for line in Path(cdn_list_file).read_text().splitlines() 
-                       if line.strip())
-
-# Cargar JSON de httpx
-try:
-    with open(httpx_json, 'r') as f:
-        results = [json.loads(line) for line in f if line.strip()]
-except Exception as e:
-    print(f"Error leyendo JSON: {e}")
-    results = []
-
-# Estructuras de datos
-ips_with_hosts = defaultdict(set)      # IP → set(hosts)
-ip_to_waf = {}                          # IP → WAF detected
-ip_to_cdn = {}                          # IP → CDN detected
-ips_cdn = set()
-ips_direct = set()
-ip_waf_lines = []
-
-# Procesar resultados
-for entry in results:
-    if not isinstance(entry, dict):
-        continue
-    
-    # Extraer IP, host, webserver, cdn_name
-    ip = entry.get('host_ip', '').strip()
-    host = entry.get('host', '') or entry.get('url', '').split('/')[2]
-    url = entry.get('url', '')
-    webserver = (entry.get('webserver') or '').lower()
-    cdn_name = (entry.get('cdn_name') or '').lower()
-    status = entry.get('status_code', 0)
-    title = entry.get('title', '')
-    
-    if not ip or ip == 'N/A':
-        continue
-    
-    # Registrar host
-    if host:
-        ips_with_hosts[ip].add(host)
-    
-    # Detectar CDN por webserver o cdn_name
-    is_cdn = False
-    waf_detected = None
-    
-    # Detección de CDN
-    for pattern in cdn_patterns:
-        if pattern in webserver or pattern in cdn_name:
-            is_cdn = True
-            waf_detected = cdn_name or webserver or 'CDN'
-            break
-    
-    # Detección de WAF por webserver (si no es CDN)
-    if not is_cdn:
-        waf_keywords = ['imperva', 'sucuri', 'incapsula', 'barracuda', 
-                        'fortinet', 'paloalto', 'f5', 'mod_security', 
-                        'aws-waf', 'azure-waf']
-        for keyword in waf_keywords:
-            if keyword in webserver:
-                waf_detected = keyword.upper()
-                break
-    
-    # Clasificar IP
-    if is_cdn:
-        ips_cdn.add(ip)
-        ip_to_cdn[ip] = waf_detected
-    else:
-        ips_direct.add(ip)
-        ip_to_waf[ip] = waf_detected
-    
-    # Generar línea TSV
-    waf_str = waf_detected or "DIRECT"
-    waf_str = f"[{waf_str}]"
-    ip_waf_lines.append(f"{ip}\t{waf_str}\t{', '.join(ips_with_hosts[ip])}")
-
-# Escribir outputs
-Path(all_ips_file).write_text('\n'.join(sorted(set(list(ips_cdn) + list(ips_direct)))) + '\n')
-Path(ips_cdn_file).write_text('\n'.join(sorted(ips_cdn)) + '\n')
-Path(ips_direct_file).write_text('\n'.join(sorted(ips_direct)) + '\n')
-
-# Escribir mapeo IP → WAF → Hosts
-with open(ip_waf_file, 'w') as f:
-    f.write("IP\tWAF/CDN\tHosts\n")
-    for line in sorted(set(ip_waf_lines)):
-        f.write(line + '\n')
-
-print(f"Total IPs: {len(ips_cdn) + len(ips_direct)}")
-print(f"  - Con CDN: {len(ips_cdn)}")
-print(f"  - Directas: {len(ips_direct)}")
-
-PYEOF
-
-  # Contar resultados
-  local total_ips=$(wc -l < "$all_ips" 2>/dev/null || echo 0)
-  local cdn_count=$(wc -l < "$ips_with_cdn" 2>/dev/null || echo 0)
-  local direct_count=$(wc -l < "$ips_direct" 2>/dev/null || echo 0)
-  
-  log_ok "IPs totales: ${total_ips} (CDN: ${cdn_count}, Directas: ${direct_count})"
-  
-  # ── Paso 4: Port scanning con naabu (solo IPs directas) ──
-  if [[ $direct_count -eq 0 ]]; then
-    log_warn "Sin IPs directas. Saltando port scan."
-    return
-  fi
-  
-  log_info "Escaneando top 1000 puertos en ${direct_count} IPs directas..."
-  
-  if ! command -v naabu &>/dev/null; then
-    log_skip "naabu"
-    > "$open_ports"
-  else
-    # Naabu: rápido y verificado
-    timeout 30m naabu \
-      -list "$ips_direct" \
-      -top-ports 1000 \
-      -rate 500 \
-      -verify \
-      -silent \
-      -o "$open_ports" \
-      2>/dev/null || true
-  fi
-  
-  local ports_found=$(wc -l < "$open_ports" 2>/dev/null || echo 0)
-  log_ok "Puertos abiertos encontrados: ${ports_found}"
-  
-  # ── Paso 5: Service detection con nmap (si hay puertos) ──
-  if [[ $ports_found -eq 0 ]]; then
-    log_warn "Sin puertos abiertos. Saltando nmap."
-    > "$port_summary"
-    return
-  fi
-  
-  log_info "Detectando servicios con nmap (máx 500 puertos)..."
-  
-  if ! command -v nmap &>/dev/null; then
-    log_skip "nmap"
-    > "$port_summary"
-  else
-    # Extraer puertos únicos (máximo 500 para no sobrecargar)
-    local ports_str
-    ports_str=$(cut -d':' -f2 "$open_ports" | sort -u | head -500 | tr '\n' ',' | sed 's/,$//')
-    
-    # Limitar IPs para nmap (máx 50 para rapidez)
-    head -50 "$ips_direct" > "$nmap_targets"
-    local nmap_ip_count=$(wc -l < "$nmap_targets")
-    
-    # Ejecutar nmap con timeout
-    timeout 45m nmap \
-      -sV -sC -T4 \
-      -iL "$nmap_targets" \
-      -p "$ports_str" \
-      --open \
-      -oX "$nmap_xml" \
-      2>/dev/null || true
-    
-    # Parsear nmap XML y generar TSV
-    _parse_nmap_xml "$nmap_xml" "$port_summary"
-    
-    log_ok "Nmap completado en ${nmap_ip_count} IPs → ${nmap_xml}"
-  fi
-  
-  # ── Paso 6: Reporte final ──────────────────────────────
-  _generate_ip_discover_report
-}
-
-# ──────────────────────────────────────────────
-# Helper: Parsear nmap XML y generar TSV
-# ──────────────────────────────────────────────
-_parse_nmap_xml() {
-  local xml_file="$1"
-  local output_tsv="$2"
-  
-  [[ ! -f "$xml_file" ]] && { > "$output_tsv"; return; }
-  
-  python3 - <<NMAP_PARSE
-import xml.etree.ElementTree as ET
-import sys
-from pathlib import Path
-
-xml_file = "${xml_file}"
-output_file = "${output_tsv}"
-
-try:
-    tree = ET.parse(xml_file)
-    root = tree.getroot()
-except:
-    Path(output_file).write_text("")
-    sys.exit(0)
-
-results = []
-results.append("IP\tPort\tState\tService\tVersion")
-
-for host in root.findall('.//host'):
-    address = host.find('.//address[@addrtype="ipv4"]')
-    if address is None:
-        continue
-    
-    ip = address.get('addr', 'N/A')
-    
-    for port in host.findall('.//port'):
-        port_id = port.get('portid', 'N/A')
-        state = port.find('state')
-        state_str = state.get('state', 'unknown') if state is not None else 'unknown'
-        
-        service = port.find('service')
-        if service is not None:
-            service_name = service.get('name', 'unknown')
-            version = service.get('version', '')
-            version_str = f"{service_name} {version}".strip()
-        else:
-            version_str = "unknown"
-        
-        if state_str == 'open':
-            results.append(f"{ip}\t{port_id}\t{state_str}\t{version_str}")
-
-with open(output_file, 'w') as f:
-    f.write('\n'.join(results) + '\n')
-
-NMAP_PARSE
-}
-
-# ──────────────────────────────────────────────
-# Helper: Generar reporte de IP Discovery
-# ──────────────────────────────────────────────
-_generate_ip_discover_report() {
-  local ip_dir="${IP_DISCOVER_DIR}"
-  local report="${ip_dir}/ip_discovery_report.txt"
-  
-  local all_ips=$(wc -l < "${ip_dir}/all_ips.txt" 2>/dev/null || echo 0)
-  local cdn_ips=$(wc -l < "${ip_dir}/ips_behind_cdn.txt" 2>/dev/null || echo 0)
-  local direct_ips=$(wc -l < "${ip_dir}/ips_direct.txt" 2>/dev/null || echo 0)
-  local open_ports=$(wc -l < "${ip_dir}/open_ports.txt" 2>/dev/null || echo 0)
-  local services=$(tail -n +2 "${ip_dir}/port_summary.tsv" 2>/dev/null | wc -l || echo 0)
-  
-  cat > "$report" <<EOF
-╔═══════════════════════════════════════════════════════════════╗
-║            IP DISCOVERY & PORT SCANNING REPORT                ║
-╚═══════════════════════════════════════════════════════════════╝
-
- RESUMEN GENERAL:
-   Total IPs encontradas:         ${all_ips}
-   IPs detrás de CDN:             ${cdn_ips}
-   IPs directas (scanneables):    ${direct_ips}
-   Puertos abiertos descubiertos: ${open_ports}
-   Servicios identificados:       ${services}
-
- ARCHIVOS GENERADOS:
-   → all_ips.txt              (Todas las IPs únicas)
-   → ips_behind_cdn.txt       (IPs con CDN detectado)
-   → ips_direct.txt           (IPs directas, objetivo principal)
-   → ip_waf_mapping.tsv       (Mapeo IP → WAF/CDN → Hosts)
-   → open_ports.txt           (Formato: IP:Puerto)
-   → port_summary.tsv         (IP → Puerto → Servicio)
-   → nmap_full.xml            (XML completo de nmap)
-
- PRÓXIMOS PASOS:
-   1. Revisar IPs directas: cat ${ip_dir}/ips_direct.txt
-   2. Mapeos WAF: cat ${ip_dir}/ip_waf_mapping.tsv
-   3. Servicios: cat ${ip_dir}/port_summary.tsv
-   4. Para análisis profundo: nmap -sV -p- <IP> --script vuln
-
-  NOTAS:
-   • CDN detectado: No es atacable directamente
-   • IPs directas: Potencial valor alto (sin protección)
-   • Verificar permisos de scope antes de escanear
-
-EOF
-
-  log_ok "Reporte → ${report}"
-  cat "$report"
-}
-
-# ──────────────────────────────────────────────
-# COLLECT TARGETS — Handle targets file input
-# ──────────────────────────────────────────────
-collect_targets() {
-    log_section "Configurando objetivos"
-    
-    if [[ -n "${INPUT_TARGETS_FILE:-}" && -f "$INPUT_TARGETS_FILE" ]]; then
-        TARGETS_FILE="$INPUT_TARGETS_FILE"
-        log_ok "Targets file: ${TARGETS_FILE}"
-    elif [[ -n "${INPUT_TARGETS_FILE:-}" && ! -f "$INPUT_TARGETS_FILE" ]]; then
-        log_error "Archivo de targets no encontrado: ${INPUT_TARGETS_FILE}"
-    else
-        # Modo interactivo: pedir dominios al usuario
-        log_info "No se proporcionó archivo de targets. Ingresa dominios (uno por línea, Ctrl+D para terminar):"
-        TARGETS_FILE="${PROJECT_DIR}/targets_input.txt"
-        > "$TARGETS_FILE"
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && echo "$line" >> "$TARGETS_FILE"
-        done
-    fi
-    
-    # Validar que haya contenido
-    if [[ ! -s "$TARGETS_FILE" ]]; then
-        log_error "Sin objetivos válidos. El archivo de targets está vacío."
-    fi
-    
-    # Normalizar: quitar protocolos, paths, espacios y duplicados
-    sed -i 's|https\?://||g; s|/.*$||g; s|^[[:space:]]*||; s|[[:space:]]*$||' "$TARGETS_FILE"
-    sort -u "$TARGETS_FILE" -o "$TARGETS_FILE"
-    sed -i '/^[[:space:]]*$/d' "$TARGETS_FILE"
-    
-    local count
-    count=$(wc -l < "$TARGETS_FILE")
-    log_ok "Objetivos cargados: ${count} dominios raíz → ${TARGETS_FILE}"
-}
-
-# ──────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────
-main() {
-  banner
-
-  [[ $# -lt 1 ]] && usage
-
-  PROJECT_NAME="$1"
-  INPUT_TARGETS_FILE="${2:-}"
-  INPUT_OUTSCOPE_FILE="${3:-}"
-  RECON_MODE="normal"
-  SKIP_FUZZ="false"
-  WAF_DETECTED="unknown"
-  _M1_TMPDIR=""
-  _M5_TMPDIR=""
-  _TMP_DIRS=()
-
-  # Parsear flags desde cualquier posición
-  for arg in "$@"; do
-    case "$arg" in
-      --stealth)    RECON_MODE="stealth" ;;
-      --normal)     RECON_MODE="normal" ;;
-      --aggressive) RECON_MODE="aggressive" ;;
-      --skip-fuzz)  SKIP_FUZZ="true" ;;
-    esac
-  done
-
-  # Limpiar si 2do/3er arg son flags
-  [[ "${INPUT_TARGETS_FILE:-}" =~ ^-- ]] && INPUT_TARGETS_FILE=""
-  [[ "${INPUT_OUTSCOPE_FILE:-}" =~ ^-- ]] && INPUT_OUTSCOPE_FILE=""
-
-  set_mode_config
-
-  # ── Pipeline ────────────────────────────────
-  check_deps
-  create_structure
-  collect_targets
-
-  run_subdomain_enum    # M1 — subfinder+assetfinder+amass (paralelo)
-  run_dnsx              # M2 — validar DNS
-  run_wafw00f           # M3 — detectar WAF → pregunta si cambiar modo
-  run_httpx             # M4 — hosts activos + clasificación
-  run_wayback           # M5 — gau+waybackurls por dominio raíz (paralelo)
-  run_katana            # M6 — crawl priorizado y limitado
-
-  run_scoring           # M7 — attack surface scoring (Python)
-  run_secrets           # M8 — Secret Discovery
-  run_fuzzing           # M9 — Content Discovery
-  filter_out_scope      # M10 — filtrar OOS
-  run_nuclei            # M11 — nuclei
-  run_ip_discovery      # M13 — IP Discovery & Port Scanning (NUEVO)
-  generate_report       # M12 — reporte JSON
-  # ────────────────────────────────────────────
-
-  log_section "✅  Recon completado"
-  log_ok "Proyecto:  ${PROJECT_NAME}"
-  log_ok "Modo:      ${RECON_MODE}"
-  log_ok "WAF:       ${WAF_DETECTED}"
+  log_ok "Reporte final generado → ${report}"
+  log_ok "═══════════════════════════════════════════════════════════════"
   echo ""
-  log_info "Empieza por aquí:"
-  echo "    cat ${SCORING_DIR}/high_priority.txt     # Top endpoints"
-  echo "    cat ${SCORING_DIR}/idor_candidates.txt   # Candidatos IDOR"
-  echo "    cat ${SCORING_DIR}/scored_urls.tsv       # Todos con score"
-  echo "    cat ${NUCLEI_DIR}/nuclei_output.txt      # Findings nuclei"
-  echo "    cat ${SECRETS_DIR}/potential_secrets.txt # Secrets potenciales"
+  echo -e "${BOLD}PRÓXIMOS PASOS POR PRIORIDAD:${RESET}"
   echo ""
+  echo -e "  ${BRIGHT_RED}[P1]${RESET} High Priority Endpoints (Máxima criticidad):"
+  echo -e "      ${CYAN}cat${RESET} ${SCORING_DIR}/high_priority.txt | head -10"
+  echo ""
+  echo -e "  ${BRIGHT_RED}[P2]${RESET} IDOR Candidates (Lógica de negocio):"
+  echo -e "      ${CYAN}cat${RESET} ${SCORING_DIR}/idor_candidates.txt | head -10"
+  echo ""
+  echo -e "  ${YELLOW}[P3]${RESET} API Endpoints & Secrets:"
+  echo -e "      ${CYAN}cat${RESET} ${SCORING_DIR}/api_endpoints.txt | head -5"
+  echo -e "      ${CYAN}cat${RESET} ${SECRETS_DIR}/potential_secrets.txt | head -5"
+  echo ""
+  echo -e "  ${YELLOW}[P4]${RESET} Findings de Nuclei (Vulnerabilidades):"
+  echo -e "      ${CYAN}cat${RESET} ${NUCLEI_DIR}/nuclei_output.txt | head -10"
+  echo ""
+  echo -e "  ${GREEN}[P5]${RESET} Infraestructura (IPs & Servicios):"
+  echo -e "      ${CYAN}cat${RESET} ${IP_DISCOVER_DIR}/service_technology_mapping.tsv"
+  echo ""
+  echo -e "  ${BOLD}Reporte JSON Completo:${RESET}"
+  echo -e "      ${CYAN}jq .${RESET} ${report} | less"
+  echo ""
+  log_ok "═══════════════════════════════════════════════════════════════"
 }
-
-main "$@"
