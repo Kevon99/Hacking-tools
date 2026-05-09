@@ -2140,3 +2140,108 @@ EOFREPORT
   echo ""
   log_ok "═══════════════════════════════════════════════════════════════"
 }
+
+# ──────────────────────────────────────────────
+# COLLECT TARGETS — Handle targets file input
+# ──────────────────────────────────────────────
+collect_targets() {
+    log_section "Configurando objetivos"
+    if [[ -n "${INPUT_TARGETS_FILE:-}" && -f "$INPUT_TARGETS_FILE" ]]; then
+        TARGETS_FILE="$INPUT_TARGETS_FILE"
+        log_ok "Targets file: ${TARGETS_FILE}"
+    elif [[ -n "${INPUT_TARGETS_FILE:-}" && ! -f "$INPUT_TARGETS_FILE" ]]; then
+        log_error "Archivo de targets no encontrado: ${INPUT_TARGETS_FILE}"
+    else
+        # Modo interactivo: pedir dominios al usuario
+        log_info "No se proporcionó archivo de targets. Ingresa dominios (uno por línea, Ctrl+D para terminar):"
+        TARGETS_FILE="${PROJECT_DIR}/targets_input.txt"
+        > "$TARGETS_FILE"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && echo "$line" >> "$TARGETS_FILE"
+        done
+    fi
+
+    # Validar que haya contenido
+    if [[ ! -s "$TARGETS_FILE" ]]; then
+        log_error "Sin objetivos válidos. El archivo de targets está vacío."
+    fi
+
+    # Normalizar: quitar protocolos, paths, espacios y duplicados
+    sed -i 's|https\?://||g; s|/.*$||g; s|^[[:space:]]*||; s|[[:space:]]*$||' "$TARGETS_FILE"
+    sort -u "$TARGETS_FILE" -o "$TARGETS_FILE"
+    sed -i '/^[[:space:]]*$/d' "$TARGETS_FILE"
+    
+    local count
+    count=$(wc -l < "$TARGETS_FILE")
+    log_ok "Objetivos cargados: ${count} dominios raíz → ${TARGETS_FILE}"
+}
+
+# ──────────────────────────────────────────────
+# MAIN — Entry point and orchestration
+# ──────────────────────────────────────────────
+main() {
+    banner
+    [[ $# -lt 1 ]] && usage
+
+    # Inicialización de variables globales
+    PROJECT_NAME="$1"
+    INPUT_TARGETS_FILE="${2:-}"
+    INPUT_OUTSCOPE_FILE="${3:-}"
+    RECON_MODE="normal"
+    SKIP_FUZZ="false"
+    WAF_DETECTED="unknown"
+    _M1_TMPDIR=""
+    _M5_TMPDIR=""
+    _TMP_DIRS=()
+
+    # Parsear flags (stealth, aggressive, skip-fuzz)
+    for arg in "$@"; do
+        case "$arg" in
+            --stealth)    RECON_MODE="stealth" ;;
+            --normal)     RECON_MODE="normal" ;;
+            --aggressive) RECON_MODE="aggressive" ;;
+            --skip-fuzz)  SKIP_FUZZ="true" ;;
+        esac
+    done
+
+    # Limpieza de argumentos posicionales si son flags
+    [[ "${INPUT_TARGETS_FILE:-}" =~ ^-- ]] && INPUT_TARGETS_FILE=""
+    [[ "${INPUT_OUTSCOPE_FILE:-}" =~ ^-- ]] && INPUT_OUTSCOPE_FILE=""
+
+    # Configurar parámetros según el modo
+    set_mode_config
+
+    # ── PIPELINE DE EJECUCIÓN ──────────────────
+    check_deps
+    create_structure
+    collect_targets
+
+    run_subdomain_enum    # M1
+    run_dnsx              # M2
+    run_wafw00f           # M3
+    run_httpx             # M4
+    run_wayback           # M5
+    run_katana            # M6
+    run_scoring           # M7
+    run_secrets           # M8
+    run_fuzzing           # M9
+    filter_out_scope      # M10
+    run_nuclei            # M11
+    run_ip_discovery      # M13
+    generate_report       # M12
+
+    # ── CIERRE ─────────────────────────────────
+    log_section "Recon completado"
+    log_ok "Proyecto:  ${PROJECT_NAME}"
+    log_ok "Modo:      ${RECON_MODE}"
+    log_ok "WAF:       ${WAF_DETECTED}"
+    echo ""
+    log_info "Empieza por aquí:"
+    echo "    cat ${SCORING_DIR}/high_priority.txt     # Top endpoints"
+    echo "    cat ${SCORING_DIR}/idor_candidates.txt   # Candidatos IDOR"
+    echo "    cat ${NUCLEI_DIR}/nuclei_output.txt      # Findings nuclei"
+    echo ""
+}
+
+# Ejecutar el script
+main "$@"
