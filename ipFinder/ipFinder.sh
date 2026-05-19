@@ -393,117 +393,65 @@ phase1_osint() {
 }
 
 # ─── FASE 2: ENUMERACIÓN ACTIVA ───────────────────────────────────────────────
-phase2_enumeration() {
-    log_phase "FASE 2: Enumeración Activa Inteligente"
-
-    # 2.1 — Subdomain enumeration multi-source ────────────────────────────────
-    log_info "[2.1] Enumeración de subdominios (multi-fuente)..."
-    local subs_file="$OUTPUT_DIR/02_enumeration/all_subs.txt"
+phase2_enumeration_target() {
+    local target_dir="$1"
+    local target="$2"
+    log_info "[2.1] Enumeración de subdominios — $target..."
+    local subs_file="${target_dir}/02_enumeration/all_subs.txt"
     touch "$subs_file"
 
-    # subfinder
+    # 1. Activos (Subfinder/Amass)
     if has_cmd subfinder; then
-        subfinder -d "$TARGET" -silent -recursive -all \
-            -o "$OUTPUT_DIR/02_enumeration/subfinder.txt" 2>/dev/null || true
-        append_unique "$OUTPUT_DIR/02_enumeration/subfinder.txt" "$subs_file"
-        log_ok "  subfinder: $(count_lines "$OUTPUT_DIR/02_enumeration/subfinder.txt") subs"
+        subfinder -d "$target" -silent -recursive -all \
+        -o "${target_dir}/02_enumeration/subfinder.txt" 2>/dev/null || true
+        append_unique "${target_dir}/02_enumeration/subfinder.txt" "$subs_file"
     fi
-
-    # amass passive
     if has_cmd amass; then
-        timeout 120 amass enum -passive -norecursive -d "$TARGET" \
-            -o "$OUTPUT_DIR/02_enumeration/amass.txt" 2>/dev/null || true
-        append_unique "$OUTPUT_DIR/02_enumeration/amass.txt" "$subs_file"
-        log_ok "  amass: $(count_lines "$OUTPUT_DIR/02_enumeration/amass.txt") subs"
+        timeout 120 amass enum -passive -norecursive -d "$target" \
+        -o "${target_dir}/02_enumeration/amass.txt" 2>/dev/null || true
+        append_unique "${target_dir}/02_enumeration/amass.txt" "$subs_file"
     fi
 
-    # assetfinder
-    if has_cmd assetfinder; then
-        assetfinder --subs-only "$TARGET" 2>/dev/null \
-            > "$OUTPUT_DIR/02_enumeration/assetfinder.txt" || true
-        append_unique "$OUTPUT_DIR/02_enumeration/assetfinder.txt" "$subs_file"
-        log_ok "  assetfinder: $(count_lines "$OUTPUT_DIR/02_enumeration/assetfinder.txt") subs"
+    # 2. FIX CRÍTICO: Agregar subdominios encontrados en OSINT (Fase 1)
+    # Sin esto, los 48 dominios de crt.sh se pierden y el escaneo da 0 resultados
+    if [ -f "${target_dir}/01_osint/crt_domains.txt" ]; then
+        cat "${target_dir}/01_osint/crt_domains.txt" >> "$subs_file"
     fi
 
-    # chaos (Project Discovery)
-    if has_cmd chaos && has_key "CHAOS"; then
-        chaos -d "$TARGET" -key "$(get_key CHAOS)" -silent \
-            -o "$OUTPUT_DIR/02_enumeration/chaos.txt" 2>/dev/null || true
-        append_unique "$OUTPUT_DIR/02_enumeration/chaos.txt" "$subs_file"
-        log_ok "  chaos: $(count_lines "$OUTPUT_DIR/02_enumeration/chaos.txt") subs"
-    fi
-
-    # Agregar subdominios de OSINT
-    cat "$OUTPUT_DIR/01_osint/crt_domains.txt" \
-        "$OUTPUT_DIR/01_osint/st_subs.txt" \
-        "$OUTPUT_DIR/01_osint/be_subs.txt" 2>/dev/null \
-        | grep -iE "\.$TARGET$" | sort -u >> "$subs_file" || true
+    # Deduplicar
     sort -u "$subs_file" -o "$subs_file"
+    log_ok "  Subdominios totales (OSINT + Activos): $(count_lines "$subs_file")"
 
-    log_ok "Subdominios únicos totales: $(count_lines "$subs_file")"
-
-    # 2.2 — DNS Resolution completa ───────────────────────────────────────────
-    log_info "[2.2] Resolución DNS completa..."
-    local resolved_file="$OUTPUT_DIR/02_enumeration/resolved_all.txt"
-    local all_ips_raw="$OUTPUT_DIR/02_enumeration/all_ips_raw.txt"
-
+    log_info "[2.2] Resolución DNS — $target..."
+    local resolved_file="${target_dir}/02_enumeration/resolved_all.txt"
+    local all_ips_raw="${target_dir}/02_enumeration/all_ips_raw.txt"
     if has_cmd dnsx; then
         dnsx -l "$subs_file" -resp -a -aaaa -cname \
-            -silent -t "$THREADS" \
-            -o "$resolved_file" 2>/dev/null || true
+        -silent -t "$THREADS" \
+        -o "$resolved_file" 2>/dev/null || true
     else
-        # Fallback con dig
+        # Fallback básico si no hay dnsx
         while IFS= read -r sub; do
             local r; r=$(dig +short A "$sub" 2>/dev/null)
             [ -n "$r" ] && echo "$sub [$r]"
         done < "$subs_file" > "$resolved_file" || true
     fi
-
-    grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$resolved_file" 2>/dev/null | sort -u > "$all_ips_raw" || true
-    log_ok "Total IPs resueltas: $(count_lines "$all_ips_raw")"
-
-    # Agregar IPs de OSINT al pool
-    cat "$OUTPUT_DIR/01_osint/all_osint_ips.txt" >> "$all_ips_raw"
-    sort -u "$all_ips_raw" -o "$all_ips_raw"
-    log_ok "Total IPs (resolución + OSINT): $(count_lines "$all_ips_raw")"
-
-    # 2.3 — CDN Filtering (CIDR-aware) ────────────────────────────────────────
-    log_info "[2.3] Filtrando rangos CDN/WAF (CIDR-aware)..."
-    local non_cdn_ips="$OUTPUT_DIR/02_enumeration/non_cdn_ips.txt"
-    local cdn_ips="$OUTPUT_DIR/02_enumeration/cdn_ips.txt"
-    touch "$non_cdn_ips" "$cdn_ips"
-
+    grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$resolved_file" | sort -u > "$all_ips_raw"
+    log_ok "  IPs resueltas: $(count_lines "$all_ips_raw")"
+    
+    log_info "[2.3] Filtrando rangos CDN — $target..."
+    local non_cdn_ips="${target_dir}/02_enumeration/non_cdn_ips.txt"
+    touch "$non_cdn_ips"
     while IFS= read -r ip; do
         [[ -z "$ip" ]] && continue
         if is_cdn_ip "$ip"; then
-            echo "$ip" >> "$cdn_ips"
+            : # Ignorar CDN
         else
             echo "$ip" >> "$non_cdn_ips"
         fi
     done < "$all_ips_raw"
-
     sort -u "$non_cdn_ips" -o "$non_cdn_ips"
-    sort -u "$cdn_ips" -o "$cdn_ips"
-    log_ok "IPs CDN/WAF filtradas: $(count_lines "$cdn_ips")"
-    log_ok "IPs candidatas (no CDN): $(count_lines "$non_cdn_ips")"
-
-    # 2.4 — Port scanning sobre candidatas ────────────────────────────────────
-    log_info "[2.4] Port scan sobre IPs candidatas..."
-    if has_cmd nmap && [ -s "$non_cdn_ips" ]; then
-        nmap -iL "$non_cdn_ips" \
-            -p 80,443,8080,8443,8888,4443,3000,8000,9443 \
-            --open -T4 --max-retries 1 \
-            -oG "$OUTPUT_DIR/02_enumeration/nmap_open.gnmap" \
-            2>/dev/null || true
-        # Extraer IPs con puertos web abiertos
-        grep "open" "$OUTPUT_DIR/02_enumeration/nmap_open.gnmap" 2>/dev/null \
-            | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | sort -u \
-            > "$OUTPUT_DIR/02_enumeration/web_open_ips.txt" || true
-        log_ok "IPs con puertos web abiertos: $(count_lines "$OUTPUT_DIR/02_enumeration/web_open_ips.txt")"
-    else
-        cp "$non_cdn_ips" "$OUTPUT_DIR/02_enumeration/web_open_ips.txt" 2>/dev/null || true
-        log_warn "nmap no disponible, usando todas las IPs no-CDN"
-    fi
+    log_ok "  IPs no-CDN: $(count_lines "$non_cdn_ips")"
 }
 
 # ─── FASE 3: FINGERPRINTING AVANZADO ─────────────────────────────────────────
