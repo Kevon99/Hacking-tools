@@ -504,30 +504,27 @@ run_httpx() {
   local input="${SUBFINDER_DIR}/subfinder_output.txt"
   local output="${HTTPX_DIR}/httpx_output.txt"
   local output_json="${HTTPX_DIR}/httpx_output.json"
-
+  
   [[ ! -s "$input" ]] && { log_warn "Sin subdominios. Saltando."; return; }
 
-  log_info "Probando $(wc -l < "$input") hosts (threads=${THREADS})..."
+  # Crear archivos vacíos por seguridad para evitar "No such file" si httpx falla
+  mkdir -p "${HTTPX_DIR}"
+  touch "$output" "$output_json"
 
-  httpx \
-    -l "$input" \
-    -status-code -tech-detect -title -content-length -content-type \
-    -follow-redirects -fc 404 \
-    -timeout 10 -threads "$THREADS" \
-    -silent -o "$output" \
-    2>/dev/null || true
+  local input_count
+  input_count=$(wc -l < "$input" 2>/dev/null || echo 0)
+  log_info "Probando ${input_count} hosts (concurrency=${THREADS})..."
+  
+  # FIX: -threads está deprecado en httpx moderno. Se usa -c para concurrencia.
+  httpx -l "$input" -status-code -tech-detect -title -content-length -content-type \
+    -follow-redirects -fc 404 -timeout 10 -c "$THREADS" -silent -o "$output" 2>/dev/null || true
 
-  httpx \
-    -l "$input" \
-    -status-code -tech-detect -title -content-length -content-type \
-    -follow-redirects -fc 404 \
-    -timeout 10 -threads "$THREADS" \
-    -silent -json -o "$output_json" \
-    2>/dev/null || true
+  httpx -l "$input" -status-code -tech-detect -title -content-length -content-type \
+    -follow-redirects -fc 404 -timeout 10 -c "$THREADS" -silent -json -o "$output_json" 2>/dev/null || true
 
-  log_ok "Hosts activos (sin 404): $(wc -l < "$output" 2>/dev/null || echo 0)"
-
-  # Extraer subconjuntos de interés del JSON de httpx
+  local active_count
+  active_count=$(wc -l < "$output" 2>/dev/null || echo 0)
+  log_ok "Hosts activos (sin 404): ${active_count}"
   _classify_httpx_hosts
 }
 
@@ -1138,8 +1135,11 @@ run_secrets() {
     
     rm -rf "$th_scan_dir"
     
-    local th_count=$(grep -c '"DetectorName"' "$trufflehog_out" 2>/dev/null || echo 0)
-    [[ $th_count -gt 0 ]] && log_ok "  TruffleHog: ${th_count} secretos detectados"
+    local th_count
+    th_count=$(grep -c '"DetectorName"' "$trufflehog_out" 2>/dev/null) || th_count=0
+    # Limpia posibles saltos de línea o espacios extra
+    th_count=$(echo "$th_count" | tr -d '[:space:]')
+    [[ "${th_count:-0}" -gt 0 ]] && log_ok "  TruffleHog: ${th_count} secretos detectados"
   else
     log_skip "trufflehog"
     > "$trufflehog_out"
@@ -1198,7 +1198,7 @@ FPEOF
   local total_raw total_fp total_clean
   total_raw=$(wc -l < "$potential" 2>/dev/null || echo 0)
   total_fp=$(wc -l < "$false_pos" 2>/dev/null || echo 0)
-  total_clean=$(( total_raw - total_fp ))
+  total_clean=$(( ${total_raw:-0} - ${total_fp:-0} ))
   
   # Generar summary visual
   cat > "$final_report" <<EOF
