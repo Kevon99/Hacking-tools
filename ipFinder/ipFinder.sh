@@ -22,13 +22,24 @@
 #===============================================================================
 
 set -euo pipefail
-IFS=$'\n\t'
+IFS=$' \t\n'  # ← FIX: Formato estándar para evitar saltos de línea accidentales
+
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+log_info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
+log_ok()      { echo -e "${GREEN}[✔]${NC}    $*"; }
+log_warn()    { echo -e "${YELLOW}[!]${NC}    $*"; }
+log_error()   { echo -e "${RED}[✗]${NC}    $*"; }
+log_match()   { echo -e "${BOLD}${GREEN}[★ MATCH]${NC} $*"; }
+log_phase()   { echo -e "\n${CYAN}${BOLD}════════════════════════════════════${NC}"; \
+echo -e "${CYAN}${BOLD}  $*${NC}"; \
+echo -e "${CYAN}${BOLD}════════════════════════════════════${NC}"; }
 
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
-# Soporte para archivo de targets o target único
 if [[ "$1" == -* ]]; then
-    log_error "Uso: $0 <archivo_targets.txt|dominio> [threads]"
-    exit 1
+  log_error "Uso: $0 <archivo_targets.txt|dominio> [threads]"
+  exit 1
 fi
 
 TARGETS_INPUT="${1:?Uso: $0 <archivo_targets.txt|dominio> [threads]}"
@@ -61,18 +72,7 @@ fi
 
 OUTPUT_DIR="origin_hunter_${TIMESTAMP}"
 
-# ─── COLORES ──────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-log_info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
-log_ok()      { echo -e "${GREEN}[✔]${NC}    $*"; }
-log_warn()    { echo -e "${YELLOW}[!]${NC}    $*"; }
-log_error()   { echo -e "${RED}[✗]${NC}    $*"; }
-log_match()   { echo -e "${BOLD}${GREEN}[★ MATCH]${NC} $*"; }
-log_phase()   { echo -e "\n${CYAN}${BOLD}════════════════════════════════════${NC}"; \
-                echo -e "${CYAN}${BOLD}  $*${NC}"; \
-                echo -e "${CYAN}${BOLD}════════════════════════════════════${NC}"; }
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 get_key() { grep -s "^${1}=" "$API_KEYS_FILE" 2>/dev/null | cut -d'=' -f2- || echo ""; }
