@@ -412,8 +412,7 @@ phase2_enumeration_target() {
         append_unique "${target_dir}/02_enumeration/amass.txt" "$subs_file"
     fi
 
-    # 2. FIX CRÍTICO: Agregar subdominios encontrados en OSINT (Fase 1)
-    # Sin esto, los 48 dominios de crt.sh se pierden y el escaneo da 0 resultados
+    # 2.  FIX CRÍTICO: Inyectar dominios de OSINT (crt.sh) si subfinder falló
     if [ -f "${target_dir}/01_osint/crt_domains.txt" ]; then
         cat "${target_dir}/01_osint/crt_domains.txt" >> "$subs_file"
     fi
@@ -430,13 +429,12 @@ phase2_enumeration_target() {
         -silent -t "$THREADS" \
         -o "$resolved_file" 2>/dev/null || true
     else
-        # Fallback básico si no hay dnsx
         while IFS= read -r sub; do
             local r; r=$(dig +short A "$sub" 2>/dev/null)
             [ -n "$r" ] && echo "$sub [$r]"
         done < "$subs_file" > "$resolved_file" || true
     fi
-    grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$resolved_file" | sort -u > "$all_ips_raw"
+    grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$resolved_file" 2>/dev/null | sort -u > "$all_ips_raw" || touch "$all_ips_raw"
     log_ok "  IPs resueltas: $(count_lines "$all_ips_raw")"
     
     log_info "[2.3] Filtrando rangos CDN — $target..."
