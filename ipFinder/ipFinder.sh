@@ -21,7 +21,7 @@
 #   BINARYEDGE=tu_api_key
 #===============================================================================
 
-set -euo pipefail
+set -uo pipefail
 IFS=$' \t\n'  # ← FIX: Formato estándar para evitar saltos de línea accidentales
 
 
@@ -459,7 +459,7 @@ phase2_enumeration() {
         done < "$subs_file" > "$resolved_file" || true
     fi
 
-    grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$resolved_file" | sort -u > "$all_ips_raw"
+    grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$resolved_file" 2>/dev/null | sort -u > "$all_ips_raw" || true
     log_ok "Total IPs resueltas: $(count_lines "$all_ips_raw")"
 
     # Agregar IPs de OSINT al pool
@@ -1150,14 +1150,15 @@ phase4_verification_target() {
             -o /dev/null -w "%{http_code}" \
             "https://$ip" 2>/dev/null || echo "000")
         
-        [[ "$status" =~ ^(200|301|302|304|307|308)$ ]] && ((score++))
+        [[ "$status" =~ ^(200|301|302|304|307|308)$ ]] && score=$((score + 1))
+
 
         local cn
         cn=$(echo Q | openssl s_client -connect "${ip}:443" \
             -servername "$target" -timeout "$TIMEOUT_SSL" 2>/dev/null \
             | openssl x509 -noout -subject 2>/dev/null \
             | grep -oE 'CN=[^,/]+' | cut -d'=' -f2 || echo "")
-        echo "$cn" | grep -qi "${target}$" && ((score++))
+        echo "$cn" | grep -qi "${target}$" && score=$((score + 1))
 
         if [ "$score" -ge "$SCORE_THRESHOLD" ]; then
             echo "$ip | score=$score/7 | HTTP:$status CN:$cn" >> "$verified"
