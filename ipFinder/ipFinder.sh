@@ -402,12 +402,13 @@ phase2_enumeration_target() {
 
     # 1. Activos (Subfinder/Amass)
     if has_cmd subfinder; then
-        subfinder -d "$target" -silent -recursive -all \
+        command subfinder -d "$target" -silent -recursive -all \
         -o "${target_dir}/02_enumeration/subfinder.txt" 2>/dev/null || true
         append_unique "${target_dir}/02_enumeration/subfinder.txt" "$subs_file"
     fi
     if has_cmd amass; then
-        timeout 120 amass enum -passive -norecursive -d "$target" \
+        command timeout 120 command amass enum -passive -norecursive -d "$target" \
+
         -o "${target_dir}/02_enumeration/amass.txt" 2>/dev/null || true
         append_unique "${target_dir}/02_enumeration/amass.txt" "$subs_file"
     fi
@@ -664,7 +665,7 @@ phase4_verification() {
             -o /dev/null -w "%{http_code}" \
             "https://$ip" 2>/dev/null || echo "000")
         if [[ "$status" =~ ^(200|301|302|304|307|308)$ ]]; then
-            ((score++)); evidence+=("HTTP:$status")
+            score=$((score + 1)); evidence+=("HTTP:$status")
         fi
 
         # ── Criterio 2: Certificado SSL válido para el dominio ──
@@ -674,7 +675,7 @@ phase4_verification() {
             | openssl x509 -noout -subject 2>/dev/null \
             | grep -oE 'CN=[^,/]+' | cut -d'=' -f2 || echo "")
         if echo "$cn" | grep -qi "${TARGET}$"; then
-            ((score++)); evidence+=("SSL_CN:$cn")
+            score=$((score + 1)); evidence+=("SSL_CN:$cn")
         fi
 
         # ── Criterio 3: Contenido HTML contiene dominio o título ──
@@ -682,7 +683,7 @@ phase4_verification() {
         body=$(curl -sk -m "$TIMEOUT_CURL" \
             -H "Host: $TARGET" "https://$ip" 2>/dev/null)
         if echo "$body" | grep -qi "$TARGET"; then
-            ((score++)); evidence+=("CONTENT_MATCH")
+            score=$((score + 1)); evidence+=("CONTENT_MATCH")
         fi
 
         # ── Criterio 4: NO redirige al CDN ──
@@ -691,7 +692,7 @@ phase4_verification() {
             -H "Host: $TARGET" "https://$ip" 2>/dev/null \
             | grep -i "^location:" | tr -d '\r')
         if ! echo "$location" | grep -qi "cloudflare\|cloudfront\|akamai\|fastly\|sucuri\|incapsula"; then
-            ((score++)); evidence+=("NO_CDN_REDIRECT")
+            score=$((score + 1)); evidence+=("NO_CDN_REDIRECT")
         fi
 
         # ── Criterio 5: Server header NO es CDN edge ──
@@ -700,17 +701,17 @@ phase4_verification() {
             -H "Host: $TARGET" "https://$ip" 2>/dev/null \
             | grep -i "^server:" | tr -d '\r')
         if [ -n "$server_hdr" ] && ! echo "$server_hdr" | grep -qi "cloudflare\|CloudFront\|AkamaiGHost\|Sucuri"; then
-            ((score++)); evidence+=("SERVER:$(echo "$server_hdr" | awk '{print $2}')")
+            score=$((score + 1)); evidence+=("SERVER:$(echo "$server_hdr" | awk '{print $2}')")
         fi
 
         # ── Criterio 6: SSL fingerprint idéntico al de referencia ──
         if grep -qF "$ip" "$OUTPUT_DIR/03_fingerprinting/ssl_matches.txt" 2>/dev/null; then
-            ((score++)); evidence+=("SSL_FP_MATCH")
+            score=$((score + 1)); evidence+=("SSL_FP_MATCH")
         fi
 
         # ── Criterio 7: Content hash idéntico ──
         if grep -qF "$ip" "$OUTPUT_DIR/03_fingerprinting/content_matches.txt" 2>/dev/null; then
-            ((score++)); evidence+=("CONTENT_HASH_MATCH")
+            score=$((score + 1)); evidence+=("CONTENT_HASH_MATCH")
         fi
 
         # ── Resultado ──
@@ -869,7 +870,7 @@ process_multiple_targets() {
         # Limpiar espacios
         TARGET=$(echo "$TARGET" | xargs)
         
-        ((target_num++))
+        target_num=$((target_num + 1))
         
         log_phase "[$target_num/$TARGETS_COUNT] Procesando: $TARGET"
         
@@ -981,57 +982,52 @@ phase1_osint_target() {
 phase2_enumeration_target() {
     local target_dir="$1"
     local target="$2"
-    
     log_info "[2.1] Enumeración de subdominios — $target..."
     local subs_file="${target_dir}/02_enumeration/all_subs.txt"
     touch "$subs_file"
 
     if has_cmd subfinder; then
         subfinder -d "$target" -silent -recursive -all \
-            -o "${target_dir}/02_enumeration/subfinder.txt" 2>/dev/null || true
+        -o "${target_dir}/02_enumeration/subfinder.txt" 2>/dev/null || true
         append_unique "${target_dir}/02_enumeration/subfinder.txt" "$subs_file"
     fi
-
     if has_cmd amass; then
         timeout 120 amass enum -passive -norecursive -d "$target" \
-            -o "${target_dir}/02_enumeration/amass.txt" 2>/dev/null || true
+        -o "${target_dir}/02_enumeration/amass.txt" 2>/dev/null || true
         append_unique "${target_dir}/02_enumeration/amass.txt" "$subs_file"
     fi
 
+    #  FIX CRÍTICO: Inyectar dominios de OSINT (crt.sh) si las herramientas activas fallan
+    if [ -f "${target_dir}/01_osint/crt_domains.txt" ]; then
+        cat "${target_dir}/01_osint/crt_domains.txt" >> "$subs_file"
+    fi
+
     sort -u "$subs_file" -o "$subs_file"
-    log_ok "  Subdominios encontrados: $(count_lines "$subs_file")"
+    log_ok "  Subdominios totales (OSINT + Activos): $(count_lines "$subs_file")"
 
     log_info "[2.2] Resolución DNS — $target..."
     local resolved_file="${target_dir}/02_enumeration/resolved_all.txt"
     local all_ips_raw="${target_dir}/02_enumeration/all_ips_raw.txt"
-
     if has_cmd dnsx; then
         dnsx -l "$subs_file" -resp -a -aaaa -cname \
-            -silent -t "$THREADS" \
-            -o "$resolved_file" 2>/dev/null || true
+        -silent -t "$THREADS" \
+        -o "$resolved_file" 2>/dev/null || true
     else
         while IFS= read -r sub; do
             local r; r=$(dig +short A "$sub" 2>/dev/null)
             [ -n "$r" ] && echo "$sub [$r]"
         done < "$subs_file" > "$resolved_file" || true
     fi
-
-    grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$resolved_file" | sort -u > "$all_ips_raw"
+    grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' "$resolved_file" 2>/dev/null | sort -u > "$all_ips_raw" || touch "$all_ips_raw"
     log_ok "  IPs resueltas: $(count_lines "$all_ips_raw")"
-
+    
     log_info "[2.3] Filtrando rangos CDN — $target..."
     local non_cdn_ips="${target_dir}/02_enumeration/non_cdn_ips.txt"
     touch "$non_cdn_ips"
-
     while IFS= read -r ip; do
         [[ -z "$ip" ]] && continue
-        if is_cdn_ip "$ip"; then
-            :
-        else
-            echo "$ip" >> "$non_cdn_ips"
-        fi
+        is_cdn_ip "$ip" || echo "$ip" >> "$non_cdn_ips"
     done < "$all_ips_raw"
-
     sort -u "$non_cdn_ips" -o "$non_cdn_ips"
     log_ok "  IPs no-CDN: $(count_lines "$non_cdn_ips")"
 }
