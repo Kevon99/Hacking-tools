@@ -15,7 +15,6 @@
 #    [M10] Filtro out_scope          → aplica a todos los outputs
 #    [M11] Nuclei                    → sobre high_priority.txt (dedup)
 #    [M12] Reporte JSON              → estadísticas + muestras + rutas
-#    [M13] IP Discovery & Port Scanning  → extrae IPs + escanea puertos
 #
 #  Uso:
 #    bash recon.sh <proyecto> [targets.txt] [out_scope.txt] [--normal|--stealth|--aggressive]
@@ -120,7 +119,7 @@ HACKER_PRIMARY='\033[38;5;135m'     # Morado oscuro neón
 HACKER_SECONDARY='\033[38;5;196m'   # Rojo brillante neón
 
 # ──────────────────────────────────────────────
-# BANNER 
+# BANNER (actualizado: sin M13)
 # ──────────────────────────────────────────────
 banner() {
   echo -e "${HACKER_PRIMARY}${BOLD}"
@@ -329,7 +328,6 @@ create_structure() {
   SECRETS_DIR="${MAP_DIR}/secrets"
   FUZZING_DIR="${MAP_DIR}/fuzzing"
   NUCLEI_DIR="${MAP_DIR}/nuclei"
-  IP_DISCOVER_DIR="${MAP_DIR}/ip_discover"
 
   mkdir -p \
     "${PROJECT_DIR}/nmap" \
@@ -343,8 +341,7 @@ create_structure() {
     "${SCORING_DIR}" \
     "${SECRETS_DIR}" \
     "${FUZZING_DIR}" \
-    "${NUCLEI_DIR}" \
-    "${IP_DISCOVER_DIR}"
+    "${NUCLEI_DIR}"
 
   log_ok "Carpetas creadas en ./${PROJECT_NAME}/"
 }
@@ -1649,306 +1646,20 @@ PYEOF
 }
 
 # ──────────────────────────────────────────────
-# M13 — IP DISCOVERY & SMART PORT SCANNING (REDESIGNED)
-# ──────────────────────────────────────────────
-run_ip_discovery() {
-    log_section "M13 — IP Discovery & Smart Port Scanning (REDESIGNED)"
-    
-    local httpx_json="${HTTPX_DIR}/httpx_output.json"
-    local ip_dir="${IP_DISCOVER_DIR}"
-    local analysis="${ip_dir}/ip_analysis.json"
-    local direct_ips="${ip_dir}/direct_ips.txt"
-    local naabu_output="${ip_dir}/naabu_output.txt"
-    local nmap_targets="${ip_dir}/nmap_targets.txt"
-    local nmap_output="${ip_dir}/nmap_services.txt"
-    local service_map="${ip_dir}/service_technology_mapping.tsv"
-    local report="${ip_dir}/ip_discovery_report.txt"
-
-    [[ ! -s "$httpx_json" ]] && { log_warn "httpx JSON vacío."; return; }
-
-    # ── FASE 1: Extracción y Filtrado CDN/WAF ──────────────────────────
-    log_info "Analizando IPs y filtrando CDN/WAF (PHASE 1/3)..."
-    
-    python3 - <<PYEOF
-import json
-from pathlib import Path
-from collections import defaultdict
-
-httpx_json = "${httpx_json}"
-analysis_file = "${analysis}"
-direct_ips_file = "${direct_ips}"
-
-# FINGERPRINTS CDN/WAF: Si detecta esto, la IP NO se escanea
-cdn_waf_signatures = {
-    "cloudflare": ["1.1.1.", "104.16.", "104.17.", "104.18.", "104.19.", "104.20."],
-    "akamai": ["23.3.", "23.4.", "23.5.", "95.100.", "95.101."],
-    "cloudfront": ["54.", "52.", "13.", "35.", "76."],
-    "fastly": ["151.101.", "23.235."],
-    "azure": ["13.64.", "13.65.", "13.104.", "13.107.", "40."],
-    "imperva": ["199.83.", "198.143.", "198.51.", "202.123."],
-    "sucuri": ["192.88.", "185.215."],
-}
-
-analysis = {
-    "total_ips": 0,
-    "cdn_waf_ips": [],
-    "direct_ips": [],
-    "ip_to_hosts": defaultdict(list),
-    "ip_to_tech": defaultdict(list),
-    "cdn_waf_count": 0,
-}
-
-direct_ips_set = set()
-
-try:
-    with open(httpx_json) as f:
-        for line in f:
-            if not line.strip(): continue
-            entry = json.loads(line)
-            
-            ip = entry.get("host_ip", "N/A")
-            url = entry.get("url", "")
-            host = url.split("//")[1].split("/")[0] if "://" in url else ""
-            tech = entry.get("technologies", []) or []
-            
-            if ip == "N/A" or not ip: continue
-            
-            analysis["total_ips"] += 1
-            analysis["ip_to_hosts"][ip].append(host)
-            analysis["ip_to_tech"][ip].extend([t.lower() for t in tech])
-            
-            # Detectar si IP está detrás de CDN/WAF
-            is_cdn = False
-            for cdn_name, ip_ranges in cdn_waf_signatures.items():
-                if any(ip.startswith(r) for r in ip_ranges):
-                    is_cdn = True
-                    analysis["cdn_waf_ips"].append({
-                        "ip": ip,
-                        "provider": cdn_name,
-                        "hosts": [host]
-                    })
-                    analysis["cdn_waf_count"] += 1
-                    break
-            
-            # Si NO está detrás de CDN/WAF, es directo
-            if not is_cdn:
-                direct_ips_set.add(ip)
-                analysis["direct_ips"].append(ip)
-                
-except Exception as e:
-    print(f"[!] Parse error: {e}")
-
-# Dedup directas
-analysis["direct_ips"] = sorted(list(set(analysis["direct_ips"])))
-direct_ips_set = set(analysis["direct_ips"])
-
-# Guardar análisis
-Path(analysis_file).write_text(json.dumps(analysis, indent=2, default=str))
-
-# FIX 3b: Escribir IPs directas (evitar archivo de 1 byte con solo '\n')
-direct_ips_text = '\n'.join(sorted(direct_ips_set)) + '\n' if direct_ips_set else ''
-Path(direct_ips_file).write_text(direct_ips_text)
-
-print(f"[✓] Análisis completado:")
-print(f"    Total IPs: {analysis['total_ips']}")
-print(f"    Detrás CDN/WAF: {analysis['cdn_waf_count']}")
-print(f"    IPs Directas (escaneables): {len(direct_ips_set)}")
-PYEOF
-
-    local direct_count=$(wc -l < "$direct_ips" 2>/dev/null || echo 0)
-    
-    if [[ $direct_count -eq 0 ]]; then
-        log_warn "Sin IPs directas (todas detrás de CDN/WAF). IP Discovery abortado."
-        _generate_ip_report "skip"
-        return
-    fi
-
-    log_ok "IPs directas disponibles: ${direct_count}"
-
-    # ── FASE 2: Naabu Port Scanning (ADAPTATIVO) ────────────────────────
-    log_info "Escaneando puertos con naabu (PHASE 2/3)..."
-    
-    if ! command -v naabu &>/dev/null; then
-        log_skip "naabu"
-        > "$naabu_output"
-    else
-        # Rate limiter adaptativo: evitar abrumar la red
-        local naabu_rate naabu_timeout
-        case "${RECON_MODE}" in
-            stealth)    naabu_rate=100; naabu_timeout=300 ;;
-            aggressive) naabu_rate=1000; naabu_timeout=600 ;;
-            *)          naabu_rate=300; naabu_timeout=450 ;; # normal
-        esac
-
-        # TRUCO: Solo top 1000 puertos en stealth, 5000 en normal, full en aggressive
-        local port_range
-        case "${RECON_MODE}" in
-            stealth)    port_range="1-1000" ;;
-            aggressive) port_range="1-65535" ;;
-            *)          port_range="1-5000" ;; # normal
-        esac
-
-        # Naabu con fallbacks robusto
-        timeout "${naabu_timeout}" naabu \
-            -l "$direct_ips" \
-            -p "$port_range" \
-            -rate "$naabu_rate" \
-            -timeout 1000 \
-            -retries 0 \
-            -verify \
-            -silent \
-            -o "$naabu_output" \
-            2>/dev/null || {
-                log_warn "Naabu timeout. Resultados parciales guardados."
-                [[ ! -f "$naabu_output" ]] && touch "$naabu_output"
-            }
-    fi
-
-    local ports_found=$(wc -l < "$naabu_output" 2>/dev/null || echo 0)
-    [[ $ports_found -eq 0 ]] && {
-        log_warn "Sin puertos abiertos encontrados."
-        _generate_ip_report "no_ports"
-        return
-    }
-    log_ok "Puertos abiertos: ${ports_found}"
-
-    # ── FASE 3: Nmap Service Detection (SOLO PUERTOS ABIERTOS) ─────────
-    log_info "Detectando servicios con nmap (PHASE 3/3)..."
-    
-    if ! command -v nmap &>/dev/null; then
-        log_skip "nmap"
-    else
-        # Extraer IPs y puertos únicos del output de naabu
-        cut -d':' -f1 "$naabu_output" | sort -u > "$nmap_targets"
-        local target_ips=$(wc -l < "$nmap_targets")
-
-        # FIX CRÍTICO: Limitar puertos a 500 máximo para evitar ARG_MAX
-        local ports_str
-        ports_str=$(cut -d':' -f2 "$naabu_output" | \
-            sort | uniq -c | sort -rn | head -500 | \
-            awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
-
-        local total_ports=$(echo "$ports_str" | tr ',' '\n' | wc -l)
-        log_info "Nmap: ${target_ips} IPs x ${total_ports} puertos (limitado a 500)"
-
-        # Nmap ULTRA-OPTIMIZADO: Solo detección, rápido, output limpio
-        local nmap_opts="-sV -sC --script=http-title,http-server-header --version-intensity 4 -T4"
-        nmap_opts="${nmap_opts} --open --max-retries 1 --host-timeout 10s --min-rate 200"
-
-        timeout 600 nmap \
-            $nmap_opts \
-            -iL "$nmap_targets" \
-            -p "$ports_str" \
-            -oN "$nmap_output" \
-            2>/dev/null || {
-                log_warn "Nmap timeout. Resultados parciales guardados."
-                [[ ! -f "$nmap_output" ]] && touch "$nmap_output"
-            }
-    fi
-
-    # ── POST-PROCESAMIENTO: Correlacionar con Tecnologías M4 ────────────
-    log_info "Correlacionando con tecnologías de M4..."
-    
-    python3 - <<PYEOF
-import json
-import re
-from pathlib import Path
-from collections import defaultdict
-
-analysis_file = "${analysis}"
-naabu_output = "${naabu_output}"
-nmap_output = "${nmap_output}"
-service_map = "${service_map}"
-
-# Cargar análisis previo
-analysis = json.loads(Path(analysis_file).read_text())
-
-# Mapeo manual: patrón nmap → tecnología probable
-service_tech_map = {
-    "Apache": "apache",
-    "nginx": "nginx",
-    "IIS": "asp.net",
-    "Tomcat": "java",
-    "Jetty": "java",
-    "Node.js": "nodejs",
-    "Express": "nodejs",
-    "Gunicorn": "python",
-    "uWSGI": "python",
-    "Passenger": "ruby",
-    "Puma": "ruby",
-    "Unicorn": "ruby",
-    "Kestrel": "dotnet",
-    "Docker": "docker",
-    "Kubernetes": "kubernetes",
-    "Jenkins": "jenkins",
-    "Jira": "jira",
-    "Grafana": "grafana",
-    "Elasticsearch": "elasticsearch",
-    "MongoDB": "mongodb",
-    "Redis": "redis",
-    "MySQL": "mysql",
-    "PostgreSQL": "postgresql",
-    "MariaDB": "mysql",
-    "Oracle": "oracle",
-    "SSH": "ssh",
-}
-
-# Parsear nmap output y correlacionar
-service_lines = []
-if Path(nmap_output).exists():
-    nmap_content = Path(nmap_output).read_text()
-    
-    # Simple regex para extraer info: IP, puerto, estado, servicio
-    # Formato nmap -oN: "22/tcp  open  ssh        OpenSSH 7.4"
-    port_pattern = re.compile(r'(\d+)/tcp\s+(open|closed|filtered)\s+(\S+)\s+(.*)')
-    
-    for line in nmap_content.splitlines():
-        match = port_pattern.search(line)
-        if match:
-            port, state, service, version = match.groups()
-            if state == "open":
-                # Intentar mapear a tech conocida
-                tech = "unknown"
-                for sig, t in service_tech_map.items():
-                    if sig.lower() in (service + " " + version).lower():
-                        tech = t
-                        break
-                
-                service_lines.append(f"{port}\t{service}\t{version}\t{tech}")
-
-# FIX 3c: Escribir mapeo (evitar archivo de 1 byte con solo '\n')
-if service_lines:
-    with open(service_map, "w") as f:
-        f.write("Port\tService\tVersion\tTechnology\n")
-        for line in service_lines:
-            f.write(line + "\n")
-    print(f"[✓] Correlación: {len(service_lines)} servicios mapeados")
-else:
-    Path(service_map).write_text("")
-    print(f"[!] Sin servicios detectados en nmap")
-PYEOF
-
-    # ── Generar Reporte Final IP Discovery ──────────────────────────────
-    _generate_ip_report "complete"
-    log_ok "IP Discovery & Port Scanning completado (optimizado, no bloqueante)"
-}
-
-# ──────────────────────────────────────────────
-# M12 — REPORTE JSON (ACTUALIZADO PARA INCLUIR M11, M13)
+# M12 — REPORTE JSON (SIN M13)
 # ──────────────────────────────────────────────
 generate_report() {
-  log_section "M12 — Generando Reporte Final (Integración M11, M13)"
+  log_section "M12 — Generando Reporte Final"
   local report="${CONTENT_DIR}/recon_report.json"
 
   safe_wc() { [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
 
-  # Conteos estándar
+  # Conteos (sin variables de M13)
   local c_subdomains c_resolved c_active_hosts
   local c_wayback c_wayback_interesting
   local c_katana c_katana_interesting
   local c_high c_medium c_low c_idor c_api c_js c_new c_legacy
   local c_nuclei c_secrets
-  local c_direct_ips c_ports_found c_services c_cdn_waf
 
   c_subdomains=$(safe_wc "${SUBFINDER_DIR}/subfinder_output.txt")
   c_resolved=$(safe_wc "${DNSX_DIR}/dnsx_resolved.txt")
@@ -1967,23 +1678,10 @@ generate_report() {
   c_legacy=$(safe_wc "${SCORING_DIR}/legacy_endpoints.txt")
   c_nuclei=$(safe_wc "${NUCLEI_DIR}/nuclei_output.txt")
   c_secrets=$(safe_wc "${SECRETS_DIR}/potential_secrets.txt")
-  
-  # NUEVOS: M13 - IP Discovery
-  local ip_analysis="${IP_DISCOVER_DIR}/ip_analysis.json"
-  if [[ -f "$ip_analysis" ]]; then
-    c_direct_ips=$(python3 -c "import json; d=json.load(open('$ip_analysis')); print(len(d.get('direct_ips', [])))" 2>/dev/null || echo 0)
-    c_cdn_waf=$(python3 -c "import json; d=json.load(open('$ip_analysis')); print(d.get('cdn_waf_count', 0))" 2>/dev/null || echo 0)
-  else
-    c_direct_ips=0
-    c_cdn_waf=0
-  fi
-  c_ports_found=$(safe_wc "${IP_DISCOVER_DIR}/naabu_output.txt")
-  c_services=$(safe_wc "${IP_DISCOVER_DIR}/nmap_services.txt")
 
   # Targets + OOS (FIX: Usar jq para escapar caracteres)
   local targets_json outscope_json="[]" outscope_applied="false"
   
-  # Construir targets JSON de forma segura
   if [[ -f "$TARGETS_FILE" ]]; then
     targets_json=$(jq -R . "$TARGETS_FILE" | jq -s . 2>/dev/null || echo "[]")
   else
@@ -2042,13 +1740,6 @@ generate_report() {
     "vulnerability_scanning": {
       "nuclei_findings":           ${c_nuclei},
       "potential_secrets":         ${c_secrets}
-    },
-    "infrastructure": {
-      "total_ips":                 ${c_direct_ips},
-      "ips_behind_cdn_waf":        ${c_cdn_waf},
-      "direct_ips_scanned":        ${c_direct_ips},
-      "ports_open":                ${c_ports_found},
-      "services_detected":         ${c_services}
     }
   },
   "samples": {
@@ -2088,21 +1779,13 @@ generate_report() {
       "nuclei_json":            "${NUCLEI_DIR}/nuclei_output.json",
       "nuclei_analysis":        "${NUCLEI_DIR}/nuclei_tech_analysis.json",
       "potential_secrets":      "${SECRETS_DIR}/potential_secrets.txt"
-    },
-    "infrastructure": {
-      "ip_analysis":            "${IP_DISCOVER_DIR}/ip_analysis.json",
-      "direct_ips":             "${IP_DISCOVER_DIR}/direct_ips.txt",
-      "naabu_output":           "${IP_DISCOVER_DIR}/naabu_output.txt",
-      "nmap_services":          "${IP_DISCOVER_DIR}/nmap_services.txt",
-      "service_mapping":        "${IP_DISCOVER_DIR}/service_technology_mapping.tsv",
-      "ip_report":              "${IP_DISCOVER_DIR}/ip_discovery_report.txt"
     }
   },
   "recommendations": {
     "priority_1": "Revisar high_priority.txt para endpoints críticos",
     "priority_2": "Correlacionar IDOR candidates con BOLA (M7 + M11 findings)",
     "priority_3": "Validar secretos encontrados en M8 (potential_secrets.txt)",
-    "priority_4": "Analizar servicios en IPs directas (nmap_services.txt)",
+    "priority_4": "Analizar servicios con nmap externo en IPs recolectadas",
     "priority_5": "Fusionar resultados nuclei con puntuación de M7 para priorización"
   }
 }
@@ -2131,12 +1814,6 @@ EOFREPORT
   echo ""
   echo -e "  ${YELLOW}[P4]${RESET} Findings de Nuclei (Vulnerabilidades):"
   echo -e "      ${CYAN}cat${RESET} ${NUCLEI_DIR}/nuclei_output.txt | head -10"
-  echo ""
-  echo -e "  ${GREEN}[P5]${RESET} Infraestructura (IPs & Servicios):"
-  echo -e "      ${CYAN}cat${RESET} ${IP_DISCOVER_DIR}/service_technology_mapping.tsv"
-  echo ""
-  echo -e "  ${BOLD}Reporte JSON Completo:${RESET}"
-  echo -e "      ${CYAN}jq .${RESET} ${report} | less"
   echo ""
   log_ok "═══════════════════════════════════════════════════════════════"
 }
@@ -2211,7 +1888,7 @@ main() {
     # Configurar parámetros según el modo
     set_mode_config
 
-    # ── PIPELINE DE EJECUCIÓN ──────────────────
+    # ── PIPELINE DE EJECUCIÓN (SIN M13) ────────────────────
     check_deps
     create_structure
     collect_targets
@@ -2227,7 +1904,6 @@ main() {
     run_fuzzing           # M9
     filter_out_scope      # M10
     run_nuclei            # M11
-    run_ip_discovery      # M13
     generate_report       # M12
 
     # ── CIERRE ─────────────────────────────────
