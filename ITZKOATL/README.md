@@ -3,7 +3,7 @@
 **ITZKOATL** (Nahuatl: "Obsidian Serpent") is a high-performance automated reconnaissance pipeline designed for bug bounty hunters and security consultants. It intelligently triages and prioritizes, filtering noise to focus on high-impact surfaces.
 
 
-![[images/2026-09-19_19-10.png]]
+![images](images/2026-09-19_19-10.png)
 
 ---
 
