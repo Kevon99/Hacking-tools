@@ -16,8 +16,16 @@
 #    [M11] Nuclei                    → sobre high_priority.txt (dedup)
 #    [M12] Reporte JSON              → estadísticas + muestras + rutas
 #
+#  Perfiles de opsec (combinables con --normal/--stealth/--aggressive):
+#    --anon    Anonimato: exige proxy (Tor o pool socks5) y fuerza DNS/proxy
+#              nativo en binarios Go. No reduce velocidad por sí solo.
+#    --evade   Anti-bloqueo: UA aleatorio por request, TLS/headers comunes,
+#              caps de rate/threads y delay+jitter. No cambia tu IP.
+#    --ghost   Ambos: anonimato + anti-bloqueo (recomendado para bug bounty).
+#    --tor     Atajo: usa el SOCKS de Tor (127.0.0.1:9050) como egress.
+#
 #  Uso:
-#    bash recon.sh <proyecto> [targets.txt] [out_scope.txt] [--normal|--stealth|--aggressive]
+#    bash recon.sh <proyecto> [targets.txt] [out_scope.txt] [--normal|--stealth|--aggressive] [--anon|--evade|--ghost] [--tor] [--proxychains] [--verbose]
 # =============================================================================
 
 set -uo pipefail
@@ -194,6 +202,48 @@ extract_root_domain() {
 }
 
 # ──────────────────────────────────────────────
+# ANONIMATO + ANTI-BLOQUEO — utilidades
+# ──────────────────────────────────────────────
+# random_ua: devuelve un User-Agent real aleatorio en cada llamada.
+# La lista vive DENTRO de la función para que sobreviva a `export -f`
+# (las variables array no se exportan a subprocesos de GNU parallel).
+random_ua() {
+  local uas=(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+  )
+  printf '%s' "${uas[$((RANDOM % ${#uas[@]}))]}"
+}
+export -f random_ua
+
+# _evade_on / _anon_on: helpers de legibilidad
+_evade_on() { [[ "${EVADE_MODE:-false}" == "true" ]]; }
+_anon_on()  { [[ "${ANON_MODE:-false}"  == "true" ]]; }
+
+# apply_evasion_limits: capa anti-bloqueo. Recorta rates/threads a valores
+# "humanos" y garantiza delay+jitter aunque el modo elegido sea aggressive.
+apply_evasion_limits() {
+  _evade_on || return 0
+  (( THREADS > 20 ))       && THREADS=20
+  (( RATE > 25 ))          && RATE=25
+  (( NUCLEI_THREADS > 10 ))&& NUCLEI_THREADS=10
+  (( NUCLEI_RATE > 30 ))   && NUCLEI_RATE=30
+  (( FFUF_THREADS > 15 ))  && FFUF_THREADS=15
+  (( FFUF_RATE > 20 ))     && FFUF_RATE=20
+  (( KATANA_MAX_URLS > 150 )) && KATANA_MAX_URLS=150
+  [[ ${DELAY:-0} -lt 1 ]]        && DELAY=1
+  [[ ${RANDOM_DELAY:-0} -lt 3 ]] && RANDOM_DELAY=3
+  PARALLEL_JOBS=2
+  log_info "Anti-bloqueo: límites aplicados (threads=${THREADS} rate=${RATE} delay=${DELAY}+0..${RANDOM_DELAY}s jobs=2)"
+}
+
+# ──────────────────────────────────────────────
 # CONFIGURACIÓN GLOBAL DE RATE/THREADS POR MODO
 # ──────────────────────────────────────────────
 set_mode_config() {
@@ -297,7 +347,7 @@ EOF
 # USAGE
 # ──────────────────────────────────────────────
 usage() {
-  echo -e "Uso: ${BOLD}bash recon.sh <proyecto> [targets.txt] [out_scope.txt] [--normal|--stealth|--aggressive] [--skip-fuzz]${RESET}"
+  echo -e "Uso: ${BOLD}bash recon.sh <proyecto> [targets.txt] [out_scope.txt] [--normal|--stealth|--aggressive] [--anon|--evade|--ghost] [--tor] [--skip-fuzz] [--proxychains] [--verbose]${RESET}"
   echo ""
   echo "  proyecto        Nombre del programa (ej: acme)"
   echo "  targets.txt     Un dominio raíz por línea. Si no se pasa, se pide interactivo"
@@ -306,6 +356,23 @@ usage() {
   echo "  --stealth       Delays, rate bajo, UA real, limita URLs a crawlear"
   echo "  --aggressive    Sin límites, máxima velocidad (solo sin WAF)"
   echo "  --skip-fuzz     Salta ffuf/feroxbuster"
+  echo ""
+  echo -e "  ${BOLD}OpSec:${RESET}"
+  echo "  --anon          Anonimato: obliga a usar proxy (Tor/pool socks5), fuerza DNS"
+  echo "                  remoto y proxy nativo en binarios Go. Sin proxy NO arranca."
+  echo "  --evade         Anti-bloqueo: UA aleatorio, TLS común, caps de rate/threads"
+  echo "                  y delay+jitter. NO cambia tu IP (no es anonimato)."
+  echo "  --ghost         Combina --anon + --evade (recomendado)."
+  echo "  --tor           Egress por Tor: proxychains (C) + socks5h://127.0.0.1:9050 (Go)"
+  echo "  --proxychains   Ejecuta TODAS las herramientas de red vía proxychains"
+  echo "                  (requiere proxychains4/proxychains y /etc/proxychains4.conf configurado)"
+  echo "  --verbose       Modo verboso: muestra el tráfico/log de proxychains (sin -q)"
+  echo "                  para verificar que las chains están funcionando"
+  echo ""
+  echo "  Variables de entorno útiles:"
+  echo "  ITZ_PROXY       Proxy explícito para binarios Go (ej: socks5h://1.2.3.4:1080)"
+  echo "                  Úsalo con un gateway rotativo para repartir el tráfico."
+  echo "  ITZ_DNS         Resolvers para dnsx (IP:puerto,IP:puerto) — anonimato DNS."
   exit 1
 }
 
@@ -371,23 +438,35 @@ run_subdomain_enum() {
     local out="${_M1_TMPDIR}/${domain//\//_}.txt"
     > "$out"
 
+    # Proxy nativo para binarios Go (socks5h/http). Array local: sobrevive a subshells.
+    local proxy_args=()
+    [[ -n "${GO_PROXY_URL:-}" ]] && proxy_args=("-proxy" "$GO_PROXY_URL")
+
     # Subfinder: rápido y efectivo (3 min máximo)
-    timeout 3m subfinder -d "$domain" -all -silent 2>/dev/null >> "$out" || true
-    
-    # Assetfinder: casi instantáneo
+    # En modo proxy (-all es demasiado lento), se usan fuentes default y más timeout
+    local sub_flags=("-d" "$domain" "-silent")
+    local T_SUB="3m"
+    if [[ "${USE_PROXYCHAINS:-false}" == "true" ]]; then
+      T_SUB="6m"
+    else
+      sub_flags=("-d" "$domain" "-all" "-silent")
+    fi
+    timeout "$T_SUB" subfinder "${sub_flags[@]}" "${proxy_args[@]+"${proxy_args[@]}"}" 2>>"$PC_ERR" >> "$out" || true
+
+    # Assetfinder: casi instantáneo (Go respeta HTTP_PROXY del entorno)
     if command -v assetfinder &>/dev/null; then
-      assetfinder --subs-only "$domain" 2>/dev/null >> "$out" || true
+      assetfinder --subs-only "$domain" 2>>"$PC_ERR" >> "$out" || true
     fi
 
     # AMASS: Solo si el modo es AGGRESSIVE, si no, se salta (es el que traba todo)
     if [[ "${RECON_MODE}" == "aggressive" ]]; then
       if command -v amass &>/dev/null; then
-        timeout 7m amass enum -passive -d "$domain" -silent 2>/dev/null >> "$out" || true
+        timeout 7m amass enum -passive -d "$domain" -silent 2>>"$PC_ERR" >> "$out" || true
       fi
     fi
   }
   export -f _enum_domain
-  export RECON_MODE T_SUBFINDER T_ASSETFINDER T_AMASS
+  export RECON_MODE T_SUBFINDER T_ASSETFINDER T_AMASS PCMD PC_ERR USE_PROXYCHAINS
 
   if command -v parallel &>/dev/null; then
     log_info "GNU parallel --bar (${PARALLEL_JOBS} jobs)${RECON_MODE:+ | modo: $RECON_MODE}"
@@ -441,9 +520,17 @@ run_dnsx() {
     touch "$output"; return
   fi
 
+  # OpSec: anonimato DNS (resolvers propios) + rate limit anti-bloqueo
+  local dnsx_opsec=()
+  if _anon_on && [[ -n "${ITZ_DNS:-}" ]]; then
+    dnsx_opsec+=("-r" "$ITZ_DNS")
+    log_info "DNS anónimo: resolvers = ${ITZ_DNS}"
+  fi
+  _evade_on && dnsx_opsec+=("-rl" "20")
+
   log_info "Resolviendo $(wc -l < "$input") subdominios..."
-  dnsx -l "$input" -resp -a -cname -silent -o "$output_full" 2>/dev/null || true
-  dnsx -l "$input" -silent -o "$output" 2>/dev/null || true
+  dnsx -l "$input" -resp -a -cname -silent "${dnsx_opsec[@]+"${dnsx_opsec[@]}"}" -o "$output_full" 2>>"$PC_ERR" || true
+  dnsx -l "$input" -silent "${dnsx_opsec[@]+"${dnsx_opsec[@]}"}" -o "$output" 2>>"$PC_ERR" || true
 
   local before after
   before=$(wc -l < "$input")
@@ -472,7 +559,7 @@ run_wafw00f() {
 
   log_info "Detectando WAF en dominios principales..."
   # Probamos solo los dominios principales, no todos los subdominios
-  wafw00f -i "${TARGETS_FILE}" -o "$output" > /dev/null 2>&1
+  ${PCMD} wafw00f -i "${TARGETS_FILE}" -o "$output" > /dev/null 2>>"$PC_ERR"
 
   if grep -qi "is behind" "$output" 2>/dev/null; then
       WAF_DETECTED="yes"
@@ -504,6 +591,12 @@ run_httpx() {
 
   [[ ! -s "$input" ]] && { log_warn "Sin subdominios. Saltando."; return; }
 
+  # OpSec: proxy nativo (anon) + UA aleatorio (evade)
+  local pargs=()
+  [[ -n "${GO_PROXY_URL:-}" ]] && pargs=("-proxy" "$GO_PROXY_URL")
+  local evargs=()
+  _evade_on && evargs=("-random-agent")
+
   log_info "Probando $(wc -l < "$input") hosts (threads=${THREADS})..."
 
   httpx \
@@ -511,16 +604,18 @@ run_httpx() {
     -status-code -tech-detect -title -content-length -content-type \
     -follow-redirects -fc 404 \
     -timeout 10 -threads "$THREADS" \
+    "${pargs[@]+"${pargs[@]}"}" "${evargs[@]+"${evargs[@]}"}" \
     -silent -o "$output" \
-    2>/dev/null || true
+    2>>"$PC_ERR" || true
 
   httpx \
     -l "$input" \
     -status-code -tech-detect -title -content-length -content-type \
     -follow-redirects -fc 404 \
     -timeout 10 -threads "$THREADS" \
+    "${pargs[@]+"${pargs[@]}"}" "${evargs[@]+"${evargs[@]}"}" \
     -silent -json -o "$output_json" \
-    2>/dev/null || true
+    2>>"$PC_ERR" || true
 
   log_ok "Hosts activos (sin 404): $(wc -l < "$output" 2>/dev/null || echo 0)"
 
@@ -612,15 +707,16 @@ run_wayback() {
     
     # Máximo 5 minutos por dominio para traer URLs históricas
     if command -v gau &>/dev/null; then
-      echo "$domain" | timeout 5m gau --subs --threads 10 2>/dev/null >> "$out" || true
+      echo "$domain" | timeout 5m gau --subs --threads 10 2>>"$PC_ERR" >> "$out" || true
 
     fi
-    
+
     if command -v waybackurls &>/dev/null; then
-      echo "$domain" | timeout 5m waybackurls 2>/dev/null >> "$out" || true
+      echo "$domain" | timeout 5m waybackurls 2>>"$PC_ERR" >> "$out" || true
     fi
   }
   export -f _fetch_wayback
+  export PCMD PC_ERR
 
   if command -v parallel &>/dev/null; then
     log_info "GNU parallel --bar | límite: gau=${GAU_LIMIT} wayback=${WAYBACK_LIMIT} URLs/dominio"
@@ -711,6 +807,14 @@ run_katana() {
   [[ $total_input -eq 0 ]] && { log_warn "Sin input para katana."; return; }
   log_info "URLs de entrada: ${total_input}"
 
+  # OpSec: egress anónimo (proxy nativo) + UA aleatorio anti-fingerprint
+  local katana_extra=()
+  [[ -n "${GO_PROXY_URL:-}" ]] && katana_extra=("-proxy" "$GO_PROXY_URL")
+  local main_ua=""
+  if _evade_on || [[ "${RECON_MODE}" == "stealth" ]]; then
+    main_ua=$(random_ua)
+  fi
+
   # Flags por modo
   local katana_flags=()
   if [[ "${RECON_MODE}" == "stealth" ]]; then
@@ -718,18 +822,20 @@ run_katana() {
       "-delay" "$DELAY" "-random-delay" "$RANDOM_DELAY"
       "-rate-limit" "$RATE" "-concurrency" "$THREADS" "-parallelism" "$THREADS"
       "-timeout" "15" "-retry" "1"
-      "-headers" "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
+    [[ -n "$main_ua" ]] && katana_flags+=("-headers" "User-Agent: ${main_ua}")
   elif [[ "${RECON_MODE}" == "aggressive" ]]; then
     katana_flags=(
       "-rate-limit" "$RATE" "-concurrency" "$THREADS" "-parallelism" "$THREADS"
       "-timeout" "8" "-retry" "3"
     )
+    _evade_on && katana_flags+=("-delay" "${DELAY:-1}" "-random-delay" "${RANDOM_DELAY:-3}" "-headers" "User-Agent: ${main_ua}")
   else
     katana_flags=(
       "-rate-limit" "$RATE" "-concurrency" "$THREADS" "-parallelism" "$THREADS"
       "-timeout" "10" "-retry" "2"
     )
+    _evade_on && katana_flags+=("-delay" "${DELAY:-1}" "-random-delay" "${RANDOM_DELAY:-3}" "-headers" "User-Agent: ${main_ua}")
   fi
 
   # Extensiones a excluir
@@ -753,8 +859,9 @@ run_katana() {
     -extension-filter "$exclude_ext" \
     -silent \
     -o "$output" \
+    "${katana_extra[@]+"${katana_extra[@]}"}" \
     "${katana_flags[@]}" \
-    2>/dev/null || true
+    2>>"$PC_ERR" || true
 
   # Filtrar endpoints interesantes
   grep -iE \
@@ -1045,11 +1152,16 @@ run_secrets() {
     
     # Descargar responses con httpx + jq
     # Capturar: headers (Authorization, X-API-Key, etc.) + body (strings sospechosas)
+    local pargs=()
+    [[ -n "${GO_PROXY_URL:-}" ]] && pargs=("-proxy" "$GO_PROXY_URL")
+    local evargs=()
+    _evade_on && evargs=("-random-agent")
     httpx \
       -l "$urls_file" \
       -status-code -header "Authorization" -header "X-API-Key" \
       -timeout 8 -threads 15 -silent \
-      -json 2>/dev/null | \
+      "${pargs[@]+"${pargs[@]}"}" "${evargs[@]+"${evargs[@]}"}" \
+      -json 2>>"$PC_ERR" | \
       jq -r '
         [
           (.headers.Authorization // empty),
@@ -1094,8 +1206,11 @@ run_secrets() {
       js_file=$(echo "$js_url" | md5sum | awk '{print $1}')
       js_file="${js_cache}/${js_file}.js"
       
-      # Descargar con timeout
-      timeout 10s curl -s "$js_url" > "$js_file" 2>/dev/null || continue
+      # Descargar con timeout (+ UA aleatorio y proxy explícito si no hay proxychains)
+      local cargs=()
+      _evade_on && cargs=("-A" "$(random_ua)")
+      [[ -n "${GO_PROXY_URL:-}" && -z "${PCMD:-}" ]] && cargs+=("-x" "$GO_PROXY_URL")
+      timeout 10s ${PCMD} curl -s "${cargs[@]+"${cargs[@]}"}" "$js_url" > "$js_file" 2>>"$PC_ERR" || continue
       
       [[ ! -s "$js_file" ]] && continue
       
@@ -1288,6 +1403,15 @@ run_fuzzing() {
     local safe_name
     safe_name=$(echo "$host" | sed 's|https\?://||;s|/.*||;s|[^a-zA-Z0-9._-]|_|g')
 
+    # OpSec (dentro de la función exportada → usar vars escalares + random_ua)
+    local ffuf_opsec=() ffuf_px=() ferox_opsec=() ferox_px=()
+    if [[ "${EVADE_MODE:-false}" == "true" ]]; then
+      ffuf_opsec=("-H" "User-Agent: $(random_ua)" "-p" "0.1-1.5")
+      ferox_opsec=("-H" "User-Agent: $(random_ua)")
+    fi
+    [[ -n "${GO_PROXY_URL:-}" ]] && ffuf_px=("-x" "$GO_PROXY_URL")
+    [[ -n "${GO_PROXY_URL:-}" ]] && ferox_px=("--proxy" "$GO_PROXY_URL")
+
     if command -v ffuf &>/dev/null; then
       local ffuf_out="${FUZZING_DIR}/ffuf_${safe_name}.json"
       # -ac: Auto-calibración (Ignora catch-alls)
@@ -1298,7 +1422,8 @@ run_fuzzing() {
         -mc 200,204,301,302,307,401,403,405,500 \
         -t "$FFUF_THREADS" -rate "$FFUF_RATE" \
         -ac -sa -timeout 10 -silent \
-        -o "$ffuf_out" -of json 2>/dev/null || true
+        "${ffuf_px[@]+"${ffuf_px[@]}"}" "${ffuf_opsec[@]+"${ffuf_opsec[@]}"}" \
+        -o "$ffuf_out" -of json 2>>"$PC_ERR" || true
 
     elif command -v feroxbuster &>/dev/null; then
       local ferox_out="${FUZZING_DIR}/feroxbuster_${safe_name}.txt"
@@ -1307,14 +1432,15 @@ run_fuzzing() {
         --url "$host" --wordlist "$wordlist" \
         --status-codes 200,204,301,302,307,401,403,405,500 \
         --threads "$FFUF_THREADS" --rate-limit "$FFUF_RATE" \
+        "${ferox_px[@]+"${ferox_px[@]}"}" "${ferox_opsec[@]+"${ferox_opsec[@]}"}" \
         --auto-tune --auto-bail --no-recursion --silent \
-        --output "$ferox_out" 2>/dev/null || true
+        --output "$ferox_out" 2>>"$PC_ERR" || true
     fi
   }
   
   # Exportar variables necesarias para sub-procesos de parallel
   export -f _fuzz_host
-  export FFUF_THREADS FFUF_RATE FUZZING_DIR
+  export FFUF_THREADS FFUF_RATE FUZZING_DIR PCMD PC_ERR EVADE_MODE GO_PROXY_URL
 
   # 4. Ejecución Paralela Controlada (Max 2 hosts al mismo tiempo para no ahogar la red local)
   if command -v parallel &>/dev/null; then
@@ -1601,8 +1727,14 @@ PYEOF
         "-stats" # Mostrar estadísticas al final
     )
 
+    # OpSec: proxy nativo (anon) + UA aleatorio (evade)
+    local nuclei_opsec=()
+    [[ -n "${GO_PROXY_URL:-}" ]] && nuclei_opsec=("-proxy" "$GO_PROXY_URL")
+    _evade_on && nuclei_opsec+=("-random-agent" "-header" "Accept-Language: en-US,en;q=0.9")
+
     # Ejecutar con timeout global + fallback robusto
-    timeout "${nuclei_timeout}" nuclei "${nuclei_flags[@]}" 2>/dev/null || {
+    timeout "${nuclei_timeout}" nuclei "${nuclei_flags[@]}" \
+        "${nuclei_opsec[@]+"${nuclei_opsec[@]}"}" 2>>"$PC_ERR" || {
         log_warn "Nuclei timeout (${nuclei_timeout}s). Recopilando resultados parciales..."
     }
 
@@ -1866,27 +1998,131 @@ main() {
     INPUT_OUTSCOPE_FILE="${3:-}"
     RECON_MODE="normal"
     SKIP_FUZZ="false"
+    USE_PROXYCHAINS="false"
+    VERBOSE="false"
+    ANON_MODE="false"
+    EVADE_MODE="false"
+    TOR_MODE="false"
+    GO_PROXY_URL="${ITZ_PROXY:-}"     # proxy nativo (socks5h/http) para binarios Go
+    PCMD=""
+    PC_ERR="/dev/null"
     WAF_DETECTED="unknown"
     _M1_TMPDIR=""
     _M5_TMPDIR=""
     _TMP_DIRS=()
 
-    # Parsear flags (stealth, aggressive, skip-fuzz)
+    # Parsear flags (modo, opsec, skip-fuzz, proxychains, verbose)
     for arg in "$@"; do
         case "$arg" in
+            -h|--help)    usage ;;
             --stealth)    RECON_MODE="stealth" ;;
             --normal)     RECON_MODE="normal" ;;
             --aggressive) RECON_MODE="aggressive" ;;
             --skip-fuzz)  SKIP_FUZZ="true" ;;
+            --anon)       ANON_MODE="true" ;;
+            --evade)      EVADE_MODE="true" ;;
+            --ghost)      ANON_MODE="true"; EVADE_MODE="true" ;;
+            --tor)        TOR_MODE="true"; ANON_MODE="true" ;;
+            --proxychains|--proxy-chains) USE_PROXYCHAINS="true" ;;
+            --verbose)                    VERBOSE="true" ;;
         esac
     done
+
+    # --anon / --tor implican enrutar por proxy (sin egress anónimo no hay anonimato)
+    [[ "$ANON_MODE" == "true" ]] && USE_PROXYCHAINS="true"
+
+    # ── Tor: fija el egress SOCKS por defecto (ITZ_PROXY lo puede sobrescribir) ──
+    if [[ "$TOR_MODE" == "true" && -z "${GO_PROXY_URL:-}" ]]; then
+        GO_PROXY_URL="socks5h://127.0.0.1:9050"
+    fi
+
+    # ── ProxyChains: detectar binario y configurar prefijo global ──
+    if [[ "$USE_PROXYCHAINS" == "true" ]]; then
+        local pc_bin=""
+        if command -v proxychains4 &>/dev/null; then
+            pc_bin="proxychains4"
+        elif command -v proxychains &>/dev/null; then
+            pc_bin="proxychains"
+        fi
+
+        if [[ -z "$pc_bin" ]]; then
+            # Sin proxychains sólo se puede proxyficar a mano (Go vía env; curl/ffuf vía flag)
+            if [[ -z "${GO_PROXY_URL:-}" ]]; then
+                echo "[✘] --anon/--proxychains requiere proxychains4/proxychains o definir ITZ_PROXY."
+                echo "    Instalar: sudo apt install proxychains4"
+                exit 1
+            fi
+            echo "[!] proxychains no instalado → sólo se proxyfican binarios Go vía ${GO_PROXY_URL}."
+            echo "    (curl vía -x, ffuf vía -x; wafw00f puede no pasar por el proxy)"
+        else
+            if [[ "$VERBOSE" == "true" ]]; then
+                # Sin -q: proxychains imprime cada conexión y la chain usada (verbose)
+                PCMD="$pc_bin"
+                PC_ERR="${PROJECT_NAME}/proxychains_traffic.log"
+            else
+                PCMD="$pc_bin -q"
+            fi
+        fi
+
+        # ── Proxy nativo para binarios GO (subfinder, httpx, katana, nuclei, ffuf, gau...) ──
+        # proxychains (LD_PRELOAD) NO intercepta syscalls de Go. Los binarios Go
+        # respetan HTTP_PROXY/HTTPS_PROXY nativos, pero SOLO con proxies socks5/http.
+        PROXY_URL="${GO_PROXY_URL:-}"
+        local pc_conf="/etc/proxychains4.conf"
+        [[ ! -f "$pc_conf" ]] && pc_conf="/etc/proxychains.conf"
+        if [[ -z "$PROXY_URL" ]]; then
+            local native_proxy
+            native_proxy=$(grep -m1 -E '^\s*(socks5|http)\s' "$pc_conf" 2>/dev/null | awk '{print $1" "$2":"$3}')
+            if [[ -n "$native_proxy" ]]; then
+                local proto addr
+                proto="${native_proxy%% *}"
+                addr="${native_proxy##* }"
+                [[ "$proto" == "socks5" ]] && proto="socks5h"   # socks5h = DNS remoto (sin fugas DNS)
+                PROXY_URL="${proto}://${addr}"
+            fi
+        fi
+
+        if [[ -n "$PROXY_URL" ]]; then
+            GO_PROXY_URL="$PROXY_URL"
+            export HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL" ALL_PROXY="$PROXY_URL"
+            # evitar doble-proxy: los binarios C enganchados por LD_PRELOAD van solo por la chain
+            [[ -n "$PCMD" ]] && PCMD="env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY $PCMD"
+            echo "[i] Binarios Go (subfinder, httpx, katana, nuclei, ffuf, gau): proxy nativo ${PROXY_URL}"
+        else
+            echo "[!] proxychains.conf solo define socks4 (Go no lo soporta y LD_PRELOAD no"
+            echo "    intercepta binarios Go)."
+            echo "    → subfinder, httpx, katana, nuclei, ffuf, gau correrán SIN proxy."
+            echo "    → curl y wafw00f sí pasarán por la chain proxychains."
+            echo "    Agrega 'socks5 ip puerto' a ${pc_conf} (Tor: socks5 127.0.0.1 9050)"
+            echo "    o exporta ITZ_PROXY=socks5h://host:puerto (ideal: gateway rotativo)."
+        fi
+        export PCMD PC_ERR USE_PROXYCHAINS VERBOSE GO_PROXY_URL
+
+        echo "[i] Egress: ${PCMD:-sin-proxychains} $([[ -n "$GO_PROXY_URL" ]] && echo "+ Go nativo ${GO_PROXY_URL}")"
+        if [[ "$VERBOSE" == "true" ]]; then
+            echo "[i] Modo VERBOSE: el tráfico de chains se guardará en: ${PC_ERR}"
+            echo "    Síguelo en vivo con:  tail -f ${PC_ERR}"
+            echo "[i] Chain cargada desde ${pc_conf:-/etc/proxychains4.conf}:"
+            grep -vE '^\s*#|^\s*$|^\s*\[' "${pc_conf:-/etc/proxychains4.conf}" 2>/dev/null | head -10 || true
+        fi
+        echo "[!] Advertencia: resolución DNS (dnsx, UDP) puede no respetar proxychains; usa ITZ_DNS."
+    elif [[ "$VERBOSE" == "true" ]]; then
+        echo "[!] --verbose solo tiene efecto junto con --proxychains (se ignora)."
+    fi
+
+    # Proxy nativo explícito (ITZ_PROXY) aunque no se active proxychains
+    if [[ -n "${GO_PROXY_URL:-}" && -z "${HTTP_PROXY:-}" ]]; then
+        export HTTP_PROXY="$GO_PROXY_URL" HTTPS_PROXY="$GO_PROXY_URL" ALL_PROXY="$GO_PROXY_URL"
+    fi
+    export GO_PROXY_URL
 
     # Limpieza de argumentos posicionales si son flags
     [[ "${INPUT_TARGETS_FILE:-}" =~ ^-- ]] && INPUT_TARGETS_FILE=""
     [[ "${INPUT_OUTSCOPE_FILE:-}" =~ ^-- ]] && INPUT_OUTSCOPE_FILE=""
 
-    # Configurar parámetros según el modo
+    # Configurar parámetros según el modo (+ capa anti-bloqueo si --evade/--ghost)
     set_mode_config
+    apply_evasion_limits
 
     # ── PIPELINE DE EJECUCIÓN (SIN M13) ────────────────────
     check_deps
@@ -1911,6 +2147,11 @@ main() {
     log_ok "Proyecto:  ${PROJECT_NAME}"
     log_ok "Modo:      ${RECON_MODE}"
     log_ok "WAF:       ${WAF_DETECTED}"
+    log_ok "Proxy:     $( [[ "$USE_PROXYCHAINS" == "true" ]] && echo "ProxyChains ON" || echo "OFF" )"
+    log_ok "OpSec:     $( [[ "$ANON_MODE" == "true" ]] && printf 'anon ' ; [[ "$EVADE_MODE" == "true" ]] && printf 'evade '; [[ "$TOR_MODE" == "true" ]] && printf 'tor '; echo )"
+    if [[ "$USE_PROXYCHAINS" == "true" && "$VERBOSE" == "true" ]]; then
+        log_ok "Verbose:   tráfico de chains → ${PC_ERR}"
+    fi
     echo ""
     log_info "Empieza por aquí:"
     echo "    cat ${SCORING_DIR}/high_priority.txt     # Top endpoints"

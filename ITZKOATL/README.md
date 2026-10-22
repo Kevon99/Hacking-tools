@@ -72,6 +72,22 @@ bash itzkoatl.sh <project_name> [targets.txt] [out_scope.txt] [--mode]
 | `--stealth` | Enables WAF-aware delays, reduced concurrency, and selective scanning. |
 | `--normal` | Balanced speed and stealth (default). |
 | `--aggressive` | Max concurrency, full scanning — use only with authorization and large IP ranges. |
+| `--skip-fuzz` | Skips the content discovery module (`ffuf` / `feroxbuster`). |
+| `--proxychains` | Routes **all** network tools through `proxychains` (proxychains4 detected automatically). Requires `/etc/proxychains4.conf` properly configured. |
+| `--verbose` | With `--proxychains`: runs proxychains without `-q` and saves the full chain traffic log to `<project>/proxychains_traffic.log` so you can verify the proxies are working (`tail -f <project>/proxychains_traffic.log`). |
+
+### ProxyChains Support
+
+Add `--proxychains` to run the entire pipeline through the proxies defined in `/etc/proxychains4.conf`:
+
+```bash
+bash itzkoatl.sh myproject targets.txt out_scope.txt --stealth --proxychains
+```
+
+Two caveats when using this mode:
+
+- **DNS leaks**: DNS resolvers (`dnsx`) and UDP traffic may bypass proxychains depending on your configuration. Use the `proxy_dns` option in your proxychains config to tunnel DNS.
+- **Go binaries** (`subfinder`, `httpx`, `katana`, `nuclei`, `ffuf`, `gau`...): proxychains hooks libc calls via `LD_PRELOAD`, but Go makes direct syscalls, so the chain cannot capture them. The script automatically handles this: it extracts the first `socks5`/`http` proxy from your proxychains config and exports it as `HTTP_PROXY`/`HTTPS_PROXY` (which Go tools honor natively). **Note: Go does not support socks4** — if your config only has socks4 proxies, the script will warn you and Go tools will run unproxied. Add at least one `socks5 ip port` line to proxyfy them. `socks5` is automatically upgraded to `socks5h` (remote DNS, no DNS leaks).
 
 ### Example Workflows
 
