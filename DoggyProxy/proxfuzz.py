@@ -16,6 +16,12 @@ linea base (sin parametro y con un parametro aleatorio) para mostrar solo los
 parametros que parecen existir. Ejemplo:
 
     proxychains4 -q python3 proxfuzz.py -url "http://50.50.50.3/shell.php?" -w params.txt
+
+Con -H se pueden enviar cabeceras extra. Si el valor contiene FUZZ se fuzzea,
+lo que permite enumerar virtual hosts / subdominios:
+
+    proxychains4 -q python3 proxfuzz.py -url http://10.0.0.5 -w subdominios.txt \
+        -H "Host: FUZZ.test.local"
 """
 
 import argparse
@@ -47,6 +53,8 @@ EXTENSIONS = [
 ]
 PARAM_MIN_DIFF = 20
 PARAM_DIFF = 0.03
+VHOST_MIN_DIFF = 20
+VHOST_DIFF = 0.03
 
 _HEX_RE = re.compile(r"\b[0-9a-fA-F]{12,}\b")
 _DIGITS_RE = re.compile(r"\d{6,}")
@@ -124,12 +132,53 @@ def _variants(word, with_ext):
         yield word + "." + ext
 
 
-def _build_target(template, word):
+def _build_target(template, word, append_path=True):
     token = quote(word, safe=SAFE_CHARS)
     if "FUZZ" in template:
         return template.replace("FUZZ", token)
+    if not append_path:
+        return template
     base = template if template.endswith("/") else template + "/"
     return base + token.lstrip("/")
+
+
+def _parse_header(raw):
+    if ":" not in raw:
+        raise ValueError("cabecera invalida (falta ':'): " + raw)
+    name, value = raw.split(":", 1)
+    name = name.strip()
+    value = value.strip()
+    if not name:
+        raise ValueError("cabecera invalida: " + raw)
+    return name, value
+
+
+def _set_header(headers, name, value):
+    low = name.lower()
+    for key in [k for k in headers if k.lower() == low]:
+        del headers[key]
+    headers[name] = value
+
+
+def _base_headers(header_templates):
+    headers = dict(HEADERS)
+    for name, value in header_templates:
+        _set_header(headers, name, value)
+    return headers
+
+
+def _build_candidate(template, word, header_templates, append_path):
+    token = quote(word, safe=SAFE_CHARS)
+    url = _build_target(template, word, append_path)
+    headers = dict(HEADERS)
+    display = None
+    for name, value in header_templates:
+        if "FUZZ" in value:
+            value = value.replace("FUZZ", token)
+            if display is None:
+                display = "%s: %s" % (name, value)
+        _set_header(headers, name, value)
+    return url, headers, display
 
 
 def _status_color(status):
@@ -148,7 +197,7 @@ def _status_color(status):
     return "\033[1;31m"
 
 
-def _request_url(url):
+def _request_url(url, headers=None):
     parts = urlsplit(url)
     scheme = (parts.scheme or "http").lower()
     if scheme not in ("http", "https"):
@@ -164,12 +213,14 @@ def _request_url(url):
     path = parts.path or "/"
     if parts.query:
         path = path + "?" + parts.query
+    if headers is None:
+        headers = HEADERS
 
     last = None
     for _ in range(2):
         try:
             conn = _get_conn(scheme, host, port)
-            conn.request("GET", path, headers=HEADERS)
+            conn.request("GET", path, headers=headers)
             resp = conn.getresponse()
             body = resp.read(MAX_BODY)
             reusable = resp.isclosed()
@@ -181,11 +232,6 @@ def _request_url(url):
             last = exc
             _close_conn()
     raise last
-
-
-def _fetch(template, word):
-    status, body, target = _request_url(_build_target(template, word))
-    return status, len(body), target
 
 
 def _normalize_hash(body):
@@ -207,7 +253,7 @@ def _build_param_target(base_url, word, value):
     )
 
 
-def _collect_param_refs(base_url):
+def _collect_param_refs(base_url, headers):
     marker = "z" + secrets.token_hex(4)
     marker_bytes = marker.encode()
     control_name = "zz" + secrets.token_hex(3)
@@ -219,7 +265,7 @@ def _collect_param_refs(base_url):
 
     for _ in range(2):
         try:
-            status, body, _ = _request_url(base_url)
+            status, body, _ = _request_url(base_url, headers)
         except Exception:
             continue
         samples += 1
@@ -230,7 +276,7 @@ def _collect_param_refs(base_url):
     for _ in range(3):
         try:
             status, body, _ = _request_url(
-                _build_param_target(base_url, control_name, marker)
+                _build_param_target(base_url, control_name, marker), headers
             )
         except Exception:
             continue
@@ -251,6 +297,53 @@ def _collect_param_refs(base_url):
         "hashes": hashes,
         "control_reflects": control_reflects,
     }
+
+
+def _normalize_vhost_hash(body, word):
+    text = body.decode("utf-8", "replace")
+    text = text.replace(word, "#")
+    text = _HEX_RE.sub("#", text)
+    text = _DIGITS_RE.sub("#", text)
+    text = _WS_RE.sub(" ", text).strip()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _collect_vhost_refs(template, header_templates, append_path):
+    statuses = set()
+    lengths = []
+    hashes = set()
+    samples = 0
+
+    for _ in range(3):
+        word = "zz" + secrets.token_hex(4)
+        url, headers, _ = _build_candidate(
+            template, word, header_templates, append_path
+        )
+        try:
+            status, body, _ = _request_url(url, headers)
+        except Exception:
+            continue
+        samples += 1
+        statuses.add(status)
+        lengths.append(len(body))
+        hashes.add(_normalize_vhost_hash(body, word))
+
+    if not samples:
+        raise RuntimeError("no se pudo obtener la linea base")
+
+    return {"statuses": statuses, "lengths": lengths, "hashes": hashes}
+
+
+def _vhost_reason(status, body, word, ref):
+    if status not in ref["statuses"]:
+        return "estado %d" % status
+    length = len(body)
+    for ref_length in ref["lengths"]:
+        if abs(length - ref_length) <= max(VHOST_MIN_DIFF, ref_length * VHOST_DIFF):
+            return None
+    if _normalize_vhost_hash(body, word) in ref["hashes"]:
+        return None
+    return "longitud"
 
 
 def _param_reason(status, body, ref):
@@ -276,7 +369,14 @@ def _print_line(line):
         _abort.set()
 
 
-def _worker(template, words, param_ref=None):
+def _worker(
+    template,
+    words,
+    header_templates,
+    append_path,
+    param_ref=None,
+    vhost_ref=None,
+):
     global _done, _errors, _hits, _err_samples
     while True:
         word = words.get()
@@ -287,12 +387,23 @@ def _worker(template, words, param_ref=None):
         t0 = time.perf_counter()
         try:
             if param_ref is None:
-                status, length, target = _fetch(template, word)
-                reason = None
+                target, headers, display = _build_candidate(
+                    template, word, header_templates, append_path
+                )
+                status, body, _ = _request_url(target, headers)
+                length = len(body)
+                if display:
+                    target = display
+                if vhost_ref is not None:
+                    reason = _vhost_reason(status, body, word, vhost_ref)
+                else:
+                    reason = None
             else:
                 name = word.split("=", 1)[0]
                 target = _build_param_target(template, word, param_ref["marker"])
-                status, body, target = _request_url(target)
+                status, body, _ = _request_url(
+                    target, _base_headers(header_templates)
+                )
                 length = len(body)
                 reason = _param_reason(status, body, param_ref)
         except Exception as exc:
@@ -311,15 +422,17 @@ def _worker(template, words, param_ref=None):
                     sys.stderr.flush()
             continue
         elapsed = (time.perf_counter() - t0) * 1000.0
-        if param_ref is None:
-            interesting = SHOW_404 or status != 404
-        else:
+        if param_ref is not None:
             interesting = reason is not None
+        elif vhost_ref is not None:
+            interesting = SHOW_404 or reason is not None
+        else:
+            interesting = SHOW_404 or status != 404
         with _stat_lock:
             _done += 1
             if interesting:
                 _hits += 1
-                if reason is not None:
+                if param_ref is not None and reason is not None:
                     _param_hits.add(name)
         if not interesting:
             continue
@@ -356,7 +469,10 @@ def _progress(start):
 def main():
     parser = argparse.ArgumentParser(
         description="Fuzzer HTTP rapido para proxychains",
-        usage="proxychains4 -q python3 proxfuzz.py -url URL -w DICCIONARIO",
+        usage=(
+            "proxychains4 -q python3 proxfuzz.py -url URL -w DICCIONARIO "
+            "[-H 'Nombre: valor']"
+        ),
     )
     parser.add_argument(
         "-url",
@@ -367,6 +483,20 @@ def main():
     parser.add_argument(
         "-w", required=True, metavar="DICCIONARIO", help="ruta del wordlist"
     )
+    parser.add_argument(
+        "-H",
+        "--header",
+        action="append",
+        default=[],
+        metavar="'Nombre: valor'",
+        help="cabecera extra; si el valor contiene FUZZ se fuzzea "
+        "(ej: -H 'Host: FUZZ.test.local')",
+    )
+    parser.add_argument(
+        "--no-vhost-filter",
+        action="store_true",
+        help="no descartar respuestas iguales a la linea base al fuzzear cabeceras",
+    )
     args = parser.parse_args()
 
     template = args.url.strip()
@@ -374,6 +504,15 @@ def main():
         template = "http://" + template
     if not template.lower().startswith(("http://", "https://")):
         parser.error("solo se admiten URLs http:// o https://")
+
+    header_templates = []
+    for raw in args.header:
+        try:
+            header_templates.append(_parse_header(raw))
+        except ValueError as exc:
+            parser.error(str(exc))
+    header_fuzz = any("FUZZ" in value for _, value in header_templates)
+    append_path = not header_fuzz
 
     try:
         fh = open(args.w, "r", encoding="utf-8", errors="replace")
@@ -383,40 +522,76 @@ def main():
     param_mode = template.endswith("?") or template.endswith("&")
     if param_mode:
         base_url = template[:-1]
+        if header_fuzz:
+            parser.error(
+                "FUZZ en cabeceras no se puede combinar con el descubrimiento "
+                "de parametros"
+            )
         with_ext = False
     else:
         base_url = template
         try:
-            with_ext = "FUZZ" not in urlsplit(template).netloc
+            netloc_fuzz = "FUZZ" in urlsplit(template).netloc
         except ValueError:
-            with_ext = True
+            netloc_fuzz = True
+        with_ext = not header_fuzz and not netloc_fuzz
 
     sys.stderr.write(
         "[i] objetivo: %s\n[i] hilos: %d | timeout: %.0fs | extensiones: %d\n"
         % (template, THREADS, TIMEOUT, len(EXTENSIONS) if with_ext else 0)
     )
+    for name, value in header_templates:
+        sys.stderr.write("[i] cabecera: %s: %s\n" % (name, value))
     if _USE_COLOR:
         sys.stderr.write(
             "[i] colores: 2xx verde | 3xx cian | 401/403 amarillo | 5xx magenta | otros rojo\n"
         )
 
+    vhost_ref = None
     if param_mode:
         sys.stderr.write(
             "[i] modo: parametros GET (linea base + comparacion de respuestas)\n"
         )
         sys.stderr.write("[i] obteniendo linea base...\n")
         try:
-            param_ref = _collect_param_refs(base_url)
+            param_ref = _collect_param_refs(
+                base_url, _base_headers(header_templates)
+            )
         except Exception as exc:
             parser.error("no se pudo obtener la linea base: %s" % exc)
         finally:
             _close_conn()
     else:
         param_ref = None
+        if header_fuzz and not args.no_vhost_filter:
+            sys.stderr.write(
+                "[i] modo: vhost / subdominios "
+                "(filtro por linea base activo)\n"
+            )
+            sys.stderr.write("[i] obteniendo linea base...\n")
+            try:
+                vhost_ref = _collect_vhost_refs(
+                    base_url, header_templates, append_path
+                )
+            except Exception as exc:
+                parser.error("no se pudo obtener la linea base: %s" % exc)
+            finally:
+                _close_conn()
 
     words = queue.Queue(maxsize=THREADS * 8)
     threads = [
-        threading.Thread(target=_worker, args=(base_url, words, param_ref), daemon=True)
+        threading.Thread(
+            target=_worker,
+            args=(
+                base_url,
+                words,
+                header_templates,
+                append_path,
+                param_ref,
+                vhost_ref,
+            ),
+            daemon=True,
+        )
         for _ in range(THREADS)
     ]
     for thread in threads:
