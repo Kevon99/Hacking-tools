@@ -22,6 +22,13 @@ lo que permite enumerar virtual hosts / subdominios:
 
     proxychains4 -q python3 proxfuzz.py -url http://10.0.0.5 -w subdominios.txt \
         -H "Host: FUZZ.test.local"
+
+Filtros estilo ffuf: -fc codigos, -fs tamanos, -fw palabras, -fl lineas y
+-fr regex sobre el cuerpo. Control de velocidad con -t hilos, -rate
+peticiones/segundo y -timeout. Con -s solo se imprimen los resultados:
+
+    proxychains4 -q python3 proxfuzz.py -url http://host/FUZZ -w wl.txt \
+        -fc 403 -fs 1234 -rate 5 -s
 """
 
 import argparse
@@ -56,6 +63,15 @@ PARAM_DIFF = 0.03
 VHOST_MIN_DIFF = 20
 VHOST_DIFF = 0.03
 
+_FILTER_CODES = None
+_FILTER_SIZES = None
+_FILTER_WORDS = None
+_FILTER_LINES = None
+_FILTER_REGEX = None
+_MATCH_CODES = None
+_RATE = 0.0
+_SILENT = False
+
 _HEX_RE = re.compile(r"\b[0-9a-fA-F]{12,}\b")
 _DIGITS_RE = re.compile(r"\d{6,}")
 _WS_RE = re.compile(r"\s+")
@@ -81,14 +97,90 @@ HEADERS = {
 _local = threading.local()
 _out_lock = threading.Lock()
 _stat_lock = threading.Lock()
+_rate_lock = threading.Lock()
 _stop = threading.Event()
 _abort = threading.Event()
 
 _done = 0
 _errors = 0
 _hits = 0
+_filtered = 0
 _err_samples = 0
 _param_hits = set()
+_rate_next = 0.0
+
+
+def _info(message):
+    if not _SILENT:
+        sys.stderr.write(message)
+        sys.stderr.flush()
+
+
+def _rate_wait():
+    global _rate_next
+    if _RATE <= 0:
+        return
+    interval = 1.0 / _RATE
+    with _rate_lock:
+        now = time.monotonic()
+        if _rate_next < now:
+            _rate_next = now
+        wait = _rate_next - now
+        _rate_next += interval
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _parse_ranges(spec, label):
+    ranges = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                low, high = part.split("-", 1)
+                low, high = int(low), int(high)
+            else:
+                low = high = int(part)
+        except ValueError:
+            raise ValueError("rango invalido en %s: %s" % (label, part))
+        if low < 0 or high < 0:
+            raise ValueError("valor negativo en %s: %s" % (label, part))
+        if low > high:
+            low, high = high, low
+        ranges.append((low, high))
+    if not ranges:
+        raise ValueError("lista vacia en %s" % label)
+    return ranges
+
+
+def _in_ranges(value, ranges):
+    for low, high in ranges:
+        if low <= value <= high:
+            return True
+    return False
+
+
+def _is_filtered(status, body):
+    if _FILTER_CODES is not None and _in_ranges(status, _FILTER_CODES):
+        return True
+    if _FILTER_SIZES is not None and _in_ranges(len(body), _FILTER_SIZES):
+        return True
+    if (
+        _FILTER_WORDS is None
+        and _FILTER_LINES is None
+        and _FILTER_REGEX is None
+    ):
+        return False
+    text = body.decode("utf-8", "replace")
+    if _FILTER_WORDS is not None and _in_ranges(len(text.split()), _FILTER_WORDS):
+        return True
+    if _FILTER_LINES is not None and _in_ranges(text.count("\n"), _FILTER_LINES):
+        return True
+    if _FILTER_REGEX is not None and _FILTER_REGEX.search(text):
+        return True
+    return False
 
 
 def _close_conn():
@@ -217,7 +309,9 @@ def _request_url(url, headers=None):
         headers = HEADERS
 
     last = None
-    for _ in range(2):
+    for attempt in range(2):
+        if attempt:
+            _rate_wait()
         try:
             conn = _get_conn(scheme, host, port)
             conn.request("GET", path, headers=headers)
@@ -262,11 +356,14 @@ def _collect_param_refs(base_url, headers):
     hashes = set()
     control_reflects = False
     samples = 0
+    last_error = None
 
     for _ in range(2):
+        _rate_wait()
         try:
             status, body, _ = _request_url(base_url, headers)
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             continue
         samples += 1
         statuses.add(status)
@@ -274,11 +371,13 @@ def _collect_param_refs(base_url, headers):
         hashes.add(_normalize_hash(body))
 
     for _ in range(3):
+        _rate_wait()
         try:
             status, body, _ = _request_url(
                 _build_param_target(base_url, control_name, marker), headers
             )
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             continue
         samples += 1
         statuses.add(status)
@@ -288,7 +387,7 @@ def _collect_param_refs(base_url, headers):
             control_reflects = True
 
     if not samples:
-        raise RuntimeError("no se pudo obtener la linea base")
+        raise RuntimeError("no se pudo obtener la linea base: %s" % last_error)
 
     return {
         "marker": marker,
@@ -313,15 +412,18 @@ def _collect_vhost_refs(template, header_templates, append_path):
     lengths = []
     hashes = set()
     samples = 0
+    last_error = None
 
     for _ in range(3):
         word = "zz" + secrets.token_hex(4)
         url, headers, _ = _build_candidate(
             template, word, header_templates, append_path
         )
+        _rate_wait()
         try:
             status, body, _ = _request_url(url, headers)
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             continue
         samples += 1
         statuses.add(status)
@@ -329,7 +431,7 @@ def _collect_vhost_refs(template, header_templates, append_path):
         hashes.add(_normalize_vhost_hash(body, word))
 
     if not samples:
-        raise RuntimeError("no se pudo obtener la linea base")
+        raise RuntimeError("no se pudo obtener la linea base: %s" % last_error)
 
     return {"statuses": statuses, "lengths": lengths, "hashes": hashes}
 
@@ -377,13 +479,14 @@ def _worker(
     param_ref=None,
     vhost_ref=None,
 ):
-    global _done, _errors, _hits, _err_samples
+    global _done, _errors, _hits, _filtered, _err_samples
     while True:
         word = words.get()
         if word is None:
             return
         if _abort.is_set():
             continue
+        _rate_wait()
         t0 = time.perf_counter()
         try:
             if param_ref is None:
@@ -428,9 +531,19 @@ def _worker(
             interesting = SHOW_404 or reason is not None
         else:
             interesting = SHOW_404 or status != 404
+        if _MATCH_CODES is not None:
+            if param_ref is None and vhost_ref is None:
+                interesting = _in_ranges(status, _MATCH_CODES)
+            else:
+                interesting = interesting and _in_ranges(status, _MATCH_CODES)
+        filtered = interesting and _is_filtered(status, body)
+        if filtered:
+            interesting = False
         with _stat_lock:
             _done += 1
-            if interesting:
+            if filtered:
+                _filtered += 1
+            elif interesting:
                 _hits += 1
                 if param_ref is not None and reason is not None:
                     _param_hits.add(name)
@@ -455,23 +568,27 @@ def _worker(
 def _progress(start):
     while not _stop.wait(0.5):
         with _stat_lock:
-            done, errors, hits = _done, _errors, _hits
+            done, errors, hits, filtered = _done, _errors, _hits, _filtered
         rate = done / max(time.time() - start, 1e-9)
         sys.stderr.write(
-            "\r[+] %d req | %d hits | %d err | %.0f req/s   "
-            % (done, hits, errors, rate)
+            "\r[+] %d req | %d hits | %d filt | %d err | %.0f req/s   "
+            % (done, hits, filtered, errors, rate)
         )
         sys.stderr.flush()
-    sys.stderr.write("\r" + " " * 72 + "\r")
+    sys.stderr.write("\r" + " " * 90 + "\r")
     sys.stderr.flush()
 
 
 def main():
+    global TIMEOUT, _RATE, _SILENT
+    global _FILTER_CODES, _FILTER_SIZES, _FILTER_WORDS, _FILTER_LINES
+    global _FILTER_REGEX, _MATCH_CODES
+
     parser = argparse.ArgumentParser(
         description="Fuzzer HTTP rapido para proxychains",
         usage=(
             "proxychains4 -q python3 proxfuzz.py -url URL -w DICCIONARIO "
-            "[-H 'Nombre: valor']"
+            "[-H 'Nombre: valor'] [opciones]"
         ),
     )
     parser.add_argument(
@@ -497,7 +614,98 @@ def main():
         action="store_true",
         help="no descartar respuestas iguales a la linea base al fuzzear cabeceras",
     )
+    parser.add_argument(
+        "-fc",
+        "--filter-code",
+        metavar="CODIGOS",
+        help="ocultar codigos de estado (ej: 403,404 o 400-499)",
+    )
+    parser.add_argument(
+        "-fs",
+        "--filter-size",
+        metavar="TAMANOS",
+        help="ocultar longitudes de respuesta (ej: 1234 o 1000-2000)",
+    )
+    parser.add_argument(
+        "-fw",
+        "--filter-words",
+        metavar="PALABRAS",
+        help="ocultar respuestas con ese numero de palabras (admite rangos)",
+    )
+    parser.add_argument(
+        "-fl",
+        "--filter-lines",
+        metavar="LINEAS",
+        help="ocultar respuestas con ese numero de lineas (admite rangos)",
+    )
+    parser.add_argument(
+        "-fr",
+        "--filter-regex",
+        metavar="REGEX",
+        help="ocultar respuestas cuyo cuerpo case con la regex",
+    )
+    parser.add_argument(
+        "-mc",
+        "--match-code",
+        metavar="CODIGOS",
+        help="mostrar solo esos codigos de estado (ej: 200,301-302)",
+    )
+    parser.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        default=THREADS,
+        metavar="N",
+        help="numero de hilos (def: %d)" % THREADS,
+    )
+    parser.add_argument(
+        "-rate",
+        "--rate",
+        type=float,
+        default=0.0,
+        metavar="N",
+        help="maximo de peticiones por segundo, 0 = sin limite (def: 0)",
+    )
+    parser.add_argument(
+        "-timeout",
+        "--timeout",
+        type=float,
+        default=TIMEOUT,
+        metavar="SEG",
+        help="timeout por peticion en segundos (def: %.0f)" % TIMEOUT,
+    )
+    parser.add_argument(
+        "-s",
+        "--silent",
+        action="store_true",
+        help="modo silencioso: sin banner ni progreso, solo resultados",
+    )
     args = parser.parse_args()
+
+    if args.threads < 1:
+        parser.error("el numero de hilos debe ser >= 1")
+    if args.rate < 0:
+        parser.error("la tasa debe ser >= 0")
+    if args.timeout <= 0:
+        parser.error("el timeout debe ser > 0")
+    try:
+        if args.filter_code:
+            _FILTER_CODES = _parse_ranges(args.filter_code, "codigos")
+        if args.filter_size:
+            _FILTER_SIZES = _parse_ranges(args.filter_size, "tamanos")
+        if args.filter_words:
+            _FILTER_WORDS = _parse_ranges(args.filter_words, "palabras")
+        if args.filter_lines:
+            _FILTER_LINES = _parse_ranges(args.filter_lines, "lineas")
+        if args.filter_regex:
+            _FILTER_REGEX = re.compile(args.filter_regex)
+        if args.match_code:
+            _MATCH_CODES = _parse_ranges(args.match_code, "codigos")
+    except (ValueError, re.error) as exc:
+        parser.error("filtro invalido: %s" % exc)
+    TIMEOUT = args.timeout
+    _RATE = args.rate
+    _SILENT = args.silent
 
     template = args.url.strip()
     if "://" not in template:
@@ -536,49 +744,51 @@ def main():
             netloc_fuzz = True
         with_ext = not header_fuzz and not netloc_fuzz
 
-    sys.stderr.write(
+    _info(
         "[i] objetivo: %s\n[i] hilos: %d | timeout: %.0fs | extensiones: %d\n"
-        % (template, THREADS, TIMEOUT, len(EXTENSIONS) if with_ext else 0)
+        % (template, args.threads, TIMEOUT, len(EXTENSIONS) if with_ext else 0)
     )
+    if _RATE > 0:
+        _info("[i] limite: %.1f req/s\n" % _RATE)
     for name, value in header_templates:
-        sys.stderr.write("[i] cabecera: %s: %s\n" % (name, value))
+        _info("[i] cabecera: %s: %s\n" % (name, value))
     if _USE_COLOR:
-        sys.stderr.write(
+        _info(
             "[i] colores: 2xx verde | 3xx cian | 401/403 amarillo | 5xx magenta | otros rojo\n"
         )
 
     vhost_ref = None
     if param_mode:
-        sys.stderr.write(
+        _info(
             "[i] modo: parametros GET (linea base + comparacion de respuestas)\n"
         )
-        sys.stderr.write("[i] obteniendo linea base...\n")
+        _info("[i] obteniendo linea base...\n")
         try:
             param_ref = _collect_param_refs(
                 base_url, _base_headers(header_templates)
             )
         except Exception as exc:
-            parser.error("no se pudo obtener la linea base: %s" % exc)
+            parser.error(str(exc))
         finally:
             _close_conn()
     else:
         param_ref = None
         if header_fuzz and not args.no_vhost_filter:
-            sys.stderr.write(
+            _info(
                 "[i] modo: vhost / subdominios "
                 "(filtro por linea base activo)\n"
             )
-            sys.stderr.write("[i] obteniendo linea base...\n")
+            _info("[i] obteniendo linea base...\n")
             try:
                 vhost_ref = _collect_vhost_refs(
                     base_url, header_templates, append_path
                 )
             except Exception as exc:
-                parser.error("no se pudo obtener la linea base: %s" % exc)
+                parser.error(str(exc))
             finally:
                 _close_conn()
 
-    words = queue.Queue(maxsize=THREADS * 8)
+    words = queue.Queue(maxsize=args.threads * 8)
     threads = [
         threading.Thread(
             target=_worker,
@@ -592,14 +802,16 @@ def main():
             ),
             daemon=True,
         )
-        for _ in range(THREADS)
+        for _ in range(args.threads)
     ]
     for thread in threads:
         thread.start()
 
     start = time.time()
-    progress = threading.Thread(target=_progress, args=(start,), daemon=True)
-    progress.start()
+    progress = None
+    if not _SILENT:
+        progress = threading.Thread(target=_progress, args=(start,), daemon=True)
+        progress.start()
 
     try:
         with fh:
@@ -625,25 +837,27 @@ def main():
     except OSError as exc:
         sys.stderr.write("\n[!] error leyendo el diccionario: %s\n" % exc)
     finally:
-        for _ in range(THREADS):
+        for _ in range(args.threads):
             words.put(None)
         deadline = time.time() + TIMEOUT + 5
         for thread in threads:
             thread.join(timeout=max(0.0, deadline - time.time()))
         _stop.set()
-        progress.join(timeout=1.0)
+        if progress is not None:
+            progress.join(timeout=1.0)
 
     with _stat_lock:
-        done, errors, hits = _done, _errors, _hits
+        done, errors, hits, filtered = _done, _errors, _hits, _filtered
     elapsed = max(time.time() - start, 1e-9)
-    sys.stderr.write(
-        "[i] %d peticiones | %d resultados | %d errores | %.1fs | %.0f req/s\n"
-        % (done, hits, errors, elapsed, done / elapsed)
+    _info(
+        "[i] %d peticiones | %d resultados | %d filtradas | %d errores "
+        "| %.1fs | %.0f req/s\n"
+        % (done, hits, filtered, errors, elapsed, done / elapsed)
     )
     if param_mode:
         with _stat_lock:
             found_params = sorted(_param_hits)
-        sys.stderr.write(
+        _info(
             "[i] parametros posibles (%d): %s\n"
             % (
                 len(found_params),
