@@ -9,12 +9,22 @@ sus variantes con las extensiones de EXTENSIONS (salvo si FUZZ esta en el
 host). Cada hilo mantiene su conexion keep-alive, de modo que el handshake
 SOCKS/TLS solo se paga una vez por hilo. Los hallazgos se colorean segun el
 codigo de estado.
+
+Si la URL termina en "?" o "&" se activa el descubrimiento de parametros GET:
+cada palabra se prueba como ?palabra=valor y su respuesta se compara con una
+linea base (sin parametro y con un parametro aleatorio) para mostrar solo los
+parametros que parecen existir. Ejemplo:
+
+    proxychains4 -q python3 proxfuzz.py -url "http://50.50.50.3/shell.php?" -w params.txt
 """
 
 import argparse
+import hashlib
 import http.client
 import os
 import queue
+import re
+import secrets
 import socket
 import ssl
 import sys
@@ -35,6 +45,12 @@ EXTENSIONS = [
     "zip", "tar.gz", "sql", "db", "sqlite",
     "conf", "config", "env", "yml", "log",
 ]
+PARAM_MIN_DIFF = 20
+PARAM_DIFF = 0.03
+
+_HEX_RE = re.compile(r"\b[0-9a-fA-F]{12,}\b")
+_DIGITS_RE = re.compile(r"\d{6,}")
+_WS_RE = re.compile(r"\s+")
 
 _RESET = "\033[0m"
 _USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
@@ -64,6 +80,7 @@ _done = 0
 _errors = 0
 _hits = 0
 _err_samples = 0
+_param_hits = set()
 
 
 def _close_conn():
@@ -131,15 +148,14 @@ def _status_color(status):
     return "\033[1;31m"
 
 
-def _fetch(template, word):
-    target = _build_target(template, word)
-    parts = urlsplit(target)
+def _request_url(url):
+    parts = urlsplit(url)
     scheme = (parts.scheme or "http").lower()
     if scheme not in ("http", "https"):
         raise ValueError("esquema no soportado: " + scheme)
     host = parts.hostname
     if not host:
-        raise ValueError("URL invalida: " + target)
+        raise ValueError("URL invalida: " + url)
     try:
         host = host.encode("idna").decode("ascii")
     except UnicodeError:
@@ -157,17 +173,110 @@ def _fetch(template, word):
             resp = conn.getresponse()
             body = resp.read(MAX_BODY)
             reusable = resp.isclosed()
-            status, length = resp.status, len(body)
+            status = resp.status
             if not reusable:
                 _close_conn()
-            return status, length, target
+            return status, body, url
         except Exception as exc:
             last = exc
             _close_conn()
     raise last
 
 
-def _worker(template, words):
+def _fetch(template, word):
+    status, body, target = _request_url(_build_target(template, word))
+    return status, len(body), target
+
+
+def _normalize_hash(body):
+    text = body.decode("utf-8", "replace")
+    text = _HEX_RE.sub("#", text)
+    text = _DIGITS_RE.sub("#", text)
+    text = _WS_RE.sub(" ", text).strip()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _build_param_target(base_url, word, value):
+    name = word.split("=", 1)[0]
+    separator = "&" if "?" in base_url else "?"
+    return "%s%s%s=%s" % (
+        base_url,
+        separator,
+        quote(name, safe="[]-._"),
+        quote(value, safe=""),
+    )
+
+
+def _collect_param_refs(base_url):
+    marker = "z" + secrets.token_hex(4)
+    marker_bytes = marker.encode()
+    control_name = "zz" + secrets.token_hex(3)
+    statuses = set()
+    lengths = []
+    hashes = set()
+    control_reflects = False
+    samples = 0
+
+    for _ in range(2):
+        try:
+            status, body, _ = _request_url(base_url)
+        except Exception:
+            continue
+        samples += 1
+        statuses.add(status)
+        lengths.append(len(body))
+        hashes.add(_normalize_hash(body))
+
+    for _ in range(3):
+        try:
+            status, body, _ = _request_url(
+                _build_param_target(base_url, control_name, marker)
+            )
+        except Exception:
+            continue
+        samples += 1
+        statuses.add(status)
+        lengths.append(len(body))
+        hashes.add(_normalize_hash(body))
+        if marker_bytes in body:
+            control_reflects = True
+
+    if not samples:
+        raise RuntimeError("no se pudo obtener la linea base")
+
+    return {
+        "marker": marker,
+        "statuses": statuses,
+        "lengths": lengths,
+        "hashes": hashes,
+        "control_reflects": control_reflects,
+    }
+
+
+def _param_reason(status, body, ref):
+    if status not in ref["statuses"]:
+        return "estado %d" % status
+    if not ref["control_reflects"] and ref["marker"].encode() in body:
+        return "reflejado"
+    length = len(body)
+    for ref_length in ref["lengths"]:
+        if abs(length - ref_length) <= max(PARAM_MIN_DIFF, ref_length * PARAM_DIFF):
+            break
+    else:
+        return "longitud"
+    if _normalize_hash(body) not in ref["hashes"]:
+        return "contenido"
+    return None
+
+
+def _print_line(line):
+    try:
+        print(line, flush=True)
+    except BrokenPipeError:
+        _abort.set()
+
+
+def _worker(template, words, param_ref=None):
     global _done, _errors, _hits, _err_samples
     while True:
         word = words.get()
@@ -177,7 +286,15 @@ def _worker(template, words):
             continue
         t0 = time.perf_counter()
         try:
-            status, length, target = _fetch(template, word)
+            if param_ref is None:
+                status, length, target = _fetch(template, word)
+                reason = None
+            else:
+                name = word.split("=", 1)[0]
+                target = _build_param_target(template, word, param_ref["marker"])
+                status, body, target = _request_url(target)
+                length = len(body)
+                reason = _param_reason(status, body, param_ref)
         except Exception as exc:
             with _stat_lock:
                 _done += 1
@@ -194,17 +311,32 @@ def _worker(template, words):
                     sys.stderr.flush()
             continue
         elapsed = (time.perf_counter() - t0) * 1000.0
-        interesting = SHOW_404 or status != 404
+        if param_ref is None:
+            interesting = SHOW_404 or status != 404
+        else:
+            interesting = reason is not None
         with _stat_lock:
             _done += 1
             if interesting:
                 _hits += 1
-        if interesting:
+                if reason is not None:
+                    _param_hits.add(name)
+        if not interesting:
+            continue
+        if param_ref is None:
             line = "%-3d %9d  %6.0fms  %s" % (status, length, elapsed, target)
-            if _USE_COLOR:
-                line = _status_color(status) + line + _RESET
-            with _out_lock:
-                print(line, flush=True)
+        else:
+            line = "[+] %-24s [%d | %db | %s]  %s" % (
+                name,
+                status,
+                length,
+                reason,
+                target,
+            )
+        if _USE_COLOR:
+            line = _status_color(status) + line + _RESET
+        with _out_lock:
+            _print_line(line)
 
 
 def _progress(start):
@@ -227,7 +359,10 @@ def main():
         usage="proxychains4 -q python3 proxfuzz.py -url URL -w DICCIONARIO",
     )
     parser.add_argument(
-        "-url", required=True, metavar="URL", help="URL objetivo (FUZZ = punto de inyeccion)"
+        "-url",
+        required=True,
+        metavar="URL",
+        help="URL objetivo (FUZZ = inyeccion; si termina en ? o & descubre parametros GET)",
     )
     parser.add_argument(
         "-w", required=True, metavar="DICCIONARIO", help="ruta del wordlist"
@@ -245,10 +380,16 @@ def main():
     except OSError as exc:
         parser.error(str(exc))
 
-    try:
-        with_ext = "FUZZ" not in urlsplit(template).netloc
-    except ValueError:
-        with_ext = True
+    param_mode = template.endswith("?") or template.endswith("&")
+    if param_mode:
+        base_url = template[:-1]
+        with_ext = False
+    else:
+        base_url = template
+        try:
+            with_ext = "FUZZ" not in urlsplit(template).netloc
+        except ValueError:
+            with_ext = True
 
     sys.stderr.write(
         "[i] objetivo: %s\n[i] hilos: %d | timeout: %.0fs | extensiones: %d\n"
@@ -259,9 +400,23 @@ def main():
             "[i] colores: 2xx verde | 3xx cian | 401/403 amarillo | 5xx magenta | otros rojo\n"
         )
 
+    if param_mode:
+        sys.stderr.write(
+            "[i] modo: parametros GET (linea base + comparacion de respuestas)\n"
+        )
+        sys.stderr.write("[i] obteniendo linea base...\n")
+        try:
+            param_ref = _collect_param_refs(base_url)
+        except Exception as exc:
+            parser.error("no se pudo obtener la linea base: %s" % exc)
+        finally:
+            _close_conn()
+    else:
+        param_ref = None
+
     words = queue.Queue(maxsize=THREADS * 8)
     threads = [
-        threading.Thread(target=_worker, args=(template, words), daemon=True)
+        threading.Thread(target=_worker, args=(base_url, words, param_ref), daemon=True)
         for _ in range(THREADS)
     ]
     for thread in threads:
@@ -310,6 +465,16 @@ def main():
         "[i] %d peticiones | %d resultados | %d errores | %.1fs | %.0f req/s\n"
         % (done, hits, errors, elapsed, done / elapsed)
     )
+    if param_mode:
+        with _stat_lock:
+            found_params = sorted(_param_hits)
+        sys.stderr.write(
+            "[i] parametros posibles (%d): %s\n"
+            % (
+                len(found_params),
+                ", ".join(found_params) if found_params else "ninguno",
+            )
+        )
     return 0
 
 
