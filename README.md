@@ -1,6 +1,6 @@
 # Hacking-tools
 
-A collection of custom offensive security tooling focused on **recon automation**, **attack surface analysis** and **data mining** during authorized security assessments and bug bounty research.
+A collection of custom offensive security tooling focused on **recon automation**, **attack surface analysis**, **data mining** and **proxy/pivoting workflows** during authorized security assessments and bug bounty research.
 
 Every tool was built to solve a real problem encountered during hands-on engagements — filtering noise, prioritizing high-impact targets and extracting value from massive data dumps.
 
@@ -14,6 +14,7 @@ Every tool was built to solve a real problem encountered during hands-on engagem
 | [CDN_FILTER](CDN_FILTER/) | Bash + jq | Extracts subdomains behind no CDN (real origin IPs) and flags critical exposures |
 | [dxtaminer](dxtaminer/) | Python | High-performance data mining engine for auditing massive files (+10 GB) |
 | [Hacking_prompt](Hacking_prompt/) | Prompt | Structured AI copilot prompt for red team workflows |
+| [DoggyProxy](DoggyProxy/) | Python | Proxychains-native HTTP fuzzing, hidden parameter discovery and TCP host discovery |
 
 ---
 
@@ -74,13 +75,42 @@ Copy the content of [`Hacking_Prompt.txt`](Hacking_prompt/Hacking_Prompt.txt) as
 
 ---
 
+## DoggyProxy
+
+A proxychains-native toolkit for assessments where every request must traverse a SOCKS pivot (Tor, `ssh -D`, Chisel, Ligolo, Cobalt Strike SOCKS, etc.). Both tools use plain TCP `connect()` plus persistent keep-alive connections, so they stay fast through proxychains and do not depend on DNS, ICMP or raw sockets.
+
+- **`proxfuzz.py`** — concurrent HTTP/HTTPS fuzzing of paths and files with automatic extensions, plus hidden **GET parameter discovery** using baseline comparison (status, reflected markers, body length and normalized content hashes). Only takes `-url` and `-w`.
+- **`proxydiscover.py`** — TCP-connect host discovery (`nmap -sT` style) over a CIDR range, with configurable ports, timeout and concurrency.
+
+```bash
+# Hidden parameters on a PHP shell
+proxychains4 -q ./DoggyProxy/proxfuzz.py -url "http://10.10.10.3/shell.php?" -w params.txt
+
+# Content discovery through a pivot
+proxychains4 -q ./DoggyProxy/proxfuzz.py -url http://10.10.10.3/FUZZ -w wordlist.txt
+
+# TCP host discovery on an internal /24
+proxychains4 -q ./DoggyProxy/proxydiscover.py -net 10.10.10.0/24 -p 22,80,443 -c 150
+```
+
+Full details, detection logic and proxychains tuning: [DoggyProxy/README.md](DoggyProxy/README.md)
+
+---
+
 ## Requirements
 
 | Dependency | Used by |
 |------------|---------|
 | `jq` | CDN_FILTER |
 | `subfinder`, `assetfinder`, `amass`, `wafw00f`, `ffuf`/`feroxbuster` | ITZKOATL |
-| Python 3.8+ | dxtaminer |
+| Python 3.8+ | dxtaminer, DoggyProxy |
+| `proxychains4` + reachable SOCKS/HTTP proxy | DoggyProxy |
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for the full text.
 
 ---
 
